@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ideation: Rewriting NoiseTorch as a Tauri v2 Linux App</title>
+<link rel="stylesheet" href="https://fonts.bunny.net/css?family=inter:400,500,600,700|jetbrains-mono:400,500">
+<style>
+  :root {
+    --bg: #fbfaf8;
+    --surface: #ffffff;
+    --surface-2: #f4f2ee;
+    --ink: #1c1a17;
+    --ink-2: #4a4640;
+    --ink-3: #7a746a;
+    --line: #e3ded4;
+    --line-2: #d2ccbf;
+    --accent: #b4532a;
+    --accent-soft: #fdf0e8;
+    --accent-line: #eccdb9;
+    --good: #2f6b46;
+    --good-soft: #eaf3ed;
+    --good-line: #c2ddcc;
+    --warn: #8a6410;
+    --warn-soft: #fbf3df;
+    --warn-line: #e8d9ac;
+    --bad: #9b2f2f;
+    --bad-soft: #fbeded;
+    --bad-line: #ecc9c9;
+    --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    --sans: Inter, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161513;
+      --surface: #1e1d1a;
+      --surface-2: #26241f;
+      --ink: #ece8e1;
+      --ink-2: #b8b2a7;
+      --ink-3: #8b8477;
+      --line: #322f29;
+      --line-2: #433f37;
+      --accent: #e08a5c;
+      --accent-soft: #2c211a;
+      --accent-line: #4d3626;
+      --good: #7cc396;
+      --good-soft: #1b2620;
+      --good-line: #2c4536;
+      --warn: #d7b45c;
+      --warn-soft: #272117;
+      --warn-line: #453a1f;
+      --bad: #e08585;
+      --bad-soft: #2a1c1c;
+      --bad-line: #4a2c2c;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 15.5px;
+    line-height: 1.62;
+    font-feature-settings: "cv05", "ss01";
+  }
+  .page { max-width: 900px; margin-inline: auto; padding: 3.5rem 1.5rem 5rem; }
+  p, li { max-width: 72ch; }
+  h1 {
+    font-size: 2.05rem; line-height: 1.2; font-weight: 700;
+    letter-spacing: -0.021em; margin: 0 0 .55rem;
+  }
+  h2 {
+    font-size: 1.32rem; font-weight: 650; letter-spacing: -0.012em;
+    margin: 3.4rem 0 1rem; padding-bottom: .5rem; border-bottom: 1px solid var(--line);
+  }
+  h3 { font-size: 1.09rem; font-weight: 650; letter-spacing: -0.006em; margin: 0 0 .3rem; }
+  h4 { font-size: .93rem; font-weight: 650; margin: 1.4rem 0 .35rem; color: var(--ink-2); }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  code {
+    font-family: var(--mono); font-size: .855em;
+    background: var(--surface-2); border: 1px solid var(--line);
+    border-radius: 4px; padding: .06em .32em;
+  }
+  pre {
+    font-family: var(--mono); font-size: .8rem; line-height: 1.55;
+    background: var(--surface-2); border: 1px solid var(--line);
+    border-radius: 8px; padding: .8rem .95rem; overflow-x: auto; margin: .7rem 0;
+  }
+  pre code { background: none; border: 0; padding: 0; font-size: 1em; }
+  .eyebrow {
+    font-size: .705rem; font-weight: 650; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-3); margin: 0 0 .5rem;
+  }
+  .docmeta {
+    display: flex; flex-wrap: wrap; gap: .45rem .55rem; margin: 1.1rem 0 0;
+    font-size: .8rem; color: var(--ink-2);
+  }
+  .docmeta span {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 999px; padding: .17rem .66rem;
+  }
+  .lede { font-size: 1.03rem; color: var(--ink-2); margin: 1.4rem 0 0; }
+  .stats {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: .7rem; margin: 2rem 0 0;
+  }
+  .stat {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 10px; padding: .8rem .9rem;
+  }
+  .stat b { display: block; font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.1; }
+  .stat span { font-size: .745rem; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-3); font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .885rem; }
+  th, td { text-align: left; padding: .5rem .65rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th {
+    font-size: .715rem; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--ink-3); font-weight: 650; border-bottom: 1px solid var(--line-2);
+  }
+  td:first-child { white-space: nowrap; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+  .jump { margin: 1.1rem 0 2rem; padding: 0; list-style: none; }
+  .jump li { margin: 0; border-bottom: 1px dotted var(--line); }
+  .jump a {
+    display: flex; gap: .6rem; align-items: baseline; padding: .42rem .1rem;
+    text-decoration: none; color: var(--ink);
+  }
+  .jump a:hover { color: var(--accent); }
+  .jump .n { font-family: var(--mono); font-size: .78rem; color: var(--ink-3); min-width: 1.3em; }
+  .jump .ax { margin-left: auto; font-size: .74rem; color: var(--ink-3); white-space: nowrap; }
+  article.idea {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 12px; padding: 1.3rem 1.4rem; margin: 1.1rem 0;
+  }
+  .idea-head { display: flex; gap: .7rem; align-items: baseline; flex-wrap: wrap; }
+  .rank {
+    font-family: var(--mono); font-size: .78rem; font-weight: 500;
+    background: var(--surface-2); border: 1px solid var(--line-2);
+    border-radius: 999px; padding: .1rem .55rem; color: var(--ink-2);
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: .35rem; margin: .75rem 0 .1rem; }
+  .chip {
+    font-size: .715rem; font-weight: 600; letter-spacing: .02em;
+    border-radius: 999px; padding: .15rem .6rem;
+    border: 1px solid var(--line-2); background: var(--surface-2); color: var(--ink-2);
+  }
+  .chip.hi { background: var(--good-soft); border-color: var(--good-line); color: var(--good); }
+  .chip.md { background: var(--warn-soft); border-color: var(--warn-line); color: var(--warn); }
+  .chip.ac { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent); }
+  dl.fields { margin: 1rem 0 0; }
+  dl.fields dt {
+    font-size: .705rem; font-weight: 650; letter-spacing: .085em;
+    text-transform: uppercase; color: var(--ink-3); margin-top: .95rem;
+  }
+  dl.fields dd { margin: .22rem 0 0; }
+  .quote {
+    border-left: 2px solid var(--accent-line); padding: .1rem 0 .1rem .8rem;
+    margin: .45rem 0; color: var(--ink-2); font-size: .93rem;
+  }
+  figure { margin: 1.2rem 0 .3rem; }
+  figure svg { display: block; width: 100%; height: auto; }
+  figcaption { font-size: .78rem; color: var(--ink-3); margin-top: .45rem; }
+  .callout {
+    border-radius: 10px; padding: .85rem 1rem; margin: 1.2rem 0;
+    border: 1px solid var(--accent-line); background: var(--accent-soft);
+  }
+  .callout .eyebrow { color: var(--accent); margin-bottom: .3rem; }
+  .callout p { margin: .2rem 0; }
+  .callout.warn { border-color: var(--warn-line); background: var(--warn-soft); }
+  .callout.warn .eyebrow { color: var(--warn); }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; margin: 1rem 0; }
+  .cols > div { background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; padding: .8rem .9rem; }
+  .cols h4 { margin-top: 0; }
+  @media (max-width: 640px) { .cols { grid-template-columns: 1fr; } }
+  footer.composition-signal {
+    margin-top: 4rem; padding-top: 1rem; border-top: 1px solid var(--line);
+    font-size: .78rem; color: var(--ink-3);
+  }
+  .svg-label { font-family: var(--sans); font-size: 11px; fill: #4a4640; }
+  .svg-label-sm { font-family: var(--sans); font-size: 9.5px; fill: #7a746a; }
+  .svg-title { font-family: var(--sans); font-size: 11px; font-weight: 650; fill: #1c1a17; }
+  .svg-mono { font-family: var(--mono); font-size: 9.5px; fill: #4a4640; }
+  @media (prefers-color-scheme: dark) {
+    .svg-label { fill: #b8b2a7; } .svg-label-sm { fill: #8b8477; }
+    .svg-title { fill: #ece8e1; } .svg-mono { fill: #b8b2a7; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<p class="eyebrow">Ideation</p>
+<h1>Rewriting NoiseTorch as a Tauri v2 Linux App</h1>
+<div class="docmeta">
+  <span>Date: <time datetime="2026-07-27">2026-07-27</time></span>
+  <span>Topic: noisetorch-tauri-rewrite</span>
+  <span>Focus: Tauri v2 rewrite of NoiseTorch-ng, v1 scope</span>
+  <span>Mode: repo-grounded</span>
+</div>
+
+<p class="lede">Seven directions that survived adversarial verification against this machine — sway/Wayland, waybar
+v0.15.0, PipeWire 1.6.8, WirePlumber 0.5.15. Two of the most attractive candidates were refuted by live evidence,
+and one verification result reframes the central architecture question the whole idea set was circling.</p>
+
+<div class="stats">
+  <div class="stat"><b>41</b><span>Raw candidates</span></div>
+  <div class="stat"><b>7</b><span>Survivors</span></div>
+  <div class="stat"><b>2</b><span>Refuted by evidence</span></div>
+  <div class="stat"><b>5</b><span>Axes covered</span></div>
+</div>
+
+<section id="grounding">
+<h2>Codebase Context</h2>
+
+<p><code>antibising/</code> is an empty greenfield repo — only <code>.git</code>. Nothing to refactor, nothing to
+preserve; every decision here is a first decision. The reference implementation is NoiseTorch-ng at
+<code>../nt/</code>: Go, immediate-mode <a href="https://github.com/aarzilli/nucular">nucular</a> GUI, a vendored
+PulseAudio protocol library, RNNoise embedded as a LADSPA <code>.so</code> via <code>go:embed</code> and dumped to a
+temp file at runtime, <code>CAP_SYS_RESOURCE</code> raised via <code>pkexec</code> so the RT-capable module can load.</p>
+
+<p>The stated v1 spec: a tray-resident Tauri v2 app; click the tray to open a window; select which input mics get
+noise cancelling; refresh automatically on mic hotplug; remember settings across restarts; right-click to select a mic
+(automatically setting it as the Linux default) or to turn the filter off entirely.</p>
+
+<h4>Local ground truth measured during grounding</h4>
+<ul>
+<li><strong>Desktop is sway/wlroots on Wayland</strong>, not GNOME or KDE. The tray host is <strong>waybar
+v0.15.0</strong> speaking StatusNotifierItem over D-Bus.</li>
+<li><strong>PipeWire 1.6.8</strong>, WirePlumber 0.5.15, pipewire-pulse serving the PulseAudio protocol.</li>
+<li>Three physical capture sources: a Razer Seiren Mini (USB), the Meteor Lake-P built-in digital mic, and an
+ATH-M20xBT Bluetooth headset.</li>
+<li>A <code>module-ladspa-source</code> is loaded right now with
+<code>plugin=/usr/lib/ladspa/librnnoise_ladspa.so control=95</code> — and its <code>master=</code> device no longer
+exists in the graph.</li>
+<li><code>/usr/share/pipewire/filter-chain/source-rnnoise.conf</code> ships a complete RNNoise virtual-source preset;
+<code>~/.config/pipewire/filter-chain.conf.d/</code> does not exist yet.</li>
+<li>The installed NoiseTorch binary connects to PipeWire 1.6.8 successfully and then enumerates
+<strong>zero sources</strong>.</li>
+</ul>
+
+<div class="callout">
+<p class="eyebrow">The finding that reframes the spec</p>
+<p><strong>Tauri's built-in tray cannot distinguish left-click from right-click on Linux.</strong> Tauri wraps
+<code>libappindicator</code>, whose docs state the click event "is not emitted even though the icon is shown and will
+still show a context menu on right click." The v1 spec asks for exactly that distinction — left-click opens the window,
+right-click opens a menu.</p>
+<p>But the limitation is <em>Tauri's backend, not the protocol</em>. Verified against waybar's own source: with
+<code>ItemIsMenu = false</code>, waybar calls <code>Activate</code> on left-click, <code>ContextMenu</code> on
+right-click, and <code>SecondaryActivate</code> on middle-click. Speaking StatusNotifierItem directly — via the
+<code>ksni</code> crate — restores the full spec. This is the difference between "the spec is impossible on Linux" and
+"the spec requires not using Tauri's tray."</p>
+</div>
+</section>
+
+<section id="axes">
+<h2>Topic Axes</h2>
+<ul>
+<li><strong>Filter engine</strong> — how audio actually gets denoised and routed</li>
+<li><strong>Device lifecycle</strong> — enumeration, hotplug, default-source ownership</li>
+<li><strong>Tray &amp; window shell</strong> — the tray-resident UX contract</li>
+<li><strong>State &amp; persistence</strong> — what survives app exit, PipeWire restart, reboot</li>
+<li><strong>Distribution &amp; install</strong> — packaging, privileges, dependencies</li>
+</ul>
+</section>
+
+<section id="ideas">
+<h2>Ranked Ideas</h2>
+
+<ul class="jump">
+  <li><a href="#i1"><span class="n">1.</span> The Honest Tray<span class="ax">Tray &amp; window shell</span></a></li>
+  <li><a href="#i2"><span class="n">2.</span> Two-Layer State: Modules Actuate, Config Persists<span class="ax">State &amp; persistence</span></a></li>
+  <li><a href="#i3"><span class="n">3.</span> Device Identity, Not Device Names<span class="ax">Device lifecycle</span></a></li>
+  <li><a href="#i4"><span class="n">4.</span> Own the Default at the Metadata Layer<span class="ax">Device lifecycle</span></a></li>
+  <li><a href="#i5"><span class="n">5.</span> Live Knobs — Params Without Reload<span class="ax">Filter engine</span></a></li>
+  <li><a href="#i6"><span class="n">6.</span> The Denoiser Is a Config Field<span class="ax">Filter engine</span></a></li>
+  <li><a href="#i7"><span class="n">7.</span> antibising-core — Headless Engine, Native Registry<span class="ax">Distribution &amp; install</span></a></li>
+</ul>
+
+<article class="idea" id="i1">
+<div class="idea-head"><span class="rank">1</span><h3>The Honest Tray</h3></div>
+<div class="chips">
+  <span class="chip ac">Tray &amp; window shell</span>
+  <span class="chip hi">Confidence 92%</span>
+  <span class="chip md">Complexity Medium</span>
+</div>
+
+<dl class="fields">
+<dt>Description</dt>
+<dd><p>Drop Tauri's tray entirely. Register the StatusNotifierItem yourself with the <code>ksni</code> crate,
+reporting <code>ItemIsMenu = false</code>, and implement <code>activate()</code> → show window,
+<code>menu()</code> → the mic-selection context menu. That recovers the exact interaction the v1 spec asks for.</p>
+<p>The second half is what makes it <em>honest</em>: the tray icon's state must be derived from a health check of the
+filter as it actually exists in the PipeWire graph — master device still present, links still attached — not from
+"we called load-module and it returned success." A filter whose input device vanished still reports RUNNING. Three
+states, not two: filtering, off, and <strong>broken</strong> — the last one is the state the current tooling never
+shows.</p></dd>
+
+<dt>Axis</dt>
+<dd>Tray &amp; window shell</dd>
+
+<dt>Basis</dt>
+<dd><p><code>direct:</code> waybar <code>src/modules/sni/item.cpp</code> — <code>if ((ev-&gt;button == 1 &amp;&amp;
+item_is_menu) || ev-&gt;button == 3) makeMenu(); else if (ev-&gt;button == 1) proxy_-&gt;call("Activate", ...)</code>.
+Left-click reaches <code>Activate</code> whenever the item does not claim to be a menu.</p>
+<p><code>direct:</code> <code>ksni</code> v0.3.6 exposes <code>activate(x, y)</code>,
+<code>secondary_activate(x, y)</code>, and <code>menu()</code>. It depends on zbus, not GTK or libappindicator, so it
+does not fight Tauri's event loop.</p>
+<p><code>direct:</code> Tauri's own source comment on <code>TrayIconEvent::Click</code>:
+"<strong>Linux:</strong> Unsupported. The event is not emitted even though the icon is shown."</p>
+<p><code>direct:</code> the zombie is live on this machine — <code>module-ladspa-source</code> with
+<code>master=alsa_input.pci-0000_00_1f.3-...HiFi__Mic1__source</code> is loaded and the filtered source reports
+RUNNING, while that master device returns zero matches in both <code>pactl list short sources</code> and
+<code>pw-cli list-objects Node</code>.</p></dd>
+
+<dt>Rationale</dt>
+<dd>This is the only idea that directly unblocks a stated v1 requirement that the obvious implementation path
+cannot deliver. And the honesty half addresses a failure the user is living with right now: a filter that reports
+success while producing silence costs fifteen minutes of debugging cables and app settings before anyone suspects the
+filter. A tray icon that can say "broken" is the cheapest possible fix for the most expensive possible failure.</dd>
+
+<dt>Downsides</dt>
+<dd>Hand-rolling SNI means owning re-registration when the tray host restarts — waybar restarts are routine under
+sway, and the item must re-announce itself when the D-Bus name owner reappears. Also means owning icon theming and
+menu construction that Tauri would otherwise provide. Health-checking on an interval or on Registry events adds a
+background task that must not race the UI.</dd>
+</dl>
+
+<figure>
+<svg viewBox="0 0 700 210" role="img" aria-label="Comparison of Tauri tray click handling versus direct StatusNotifierItem click handling on Linux">
+  <rect x="4" y="26" width="336" height="170" rx="9" fill="none" stroke="#d2ccbf"/>
+  <rect x="360" y="26" width="336" height="170" rx="9" fill="none" stroke="#eccdb9"/>
+  <text class="svg-title" x="18" y="18">Tauri tray (libappindicator)</text>
+  <text class="svg-title" x="374" y="18">Direct SNI (ksni)</text>
+
+  <text class="svg-label" x="22" y="52">left-click</text>
+  <line x1="86" y1="48" x2="176" y2="48" stroke="#b8b2a7" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <text class="svg-label-sm" x="186" y="51">swallowed — no event</text>
+  <text class="svg-label" x="22" y="86">right-click</text>
+  <line x1="92" y1="82" x2="176" y2="82" stroke="#7a746a" stroke-width="1.4" marker-end="url(#a1)"/>
+  <text class="svg-label-sm" x="186" y="85">context menu</text>
+  <text class="svg-label" x="22" y="120">middle-click</text>
+  <line x1="98" y1="116" x2="176" y2="116" stroke="#b8b2a7" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <text class="svg-label-sm" x="186" y="119">swallowed</text>
+  <rect x="22" y="142" width="300" height="40" rx="7" fill="#fbeded" stroke="#ecc9c9"/>
+  <text class="svg-label" x="34" y="159">One gesture reaches the app.</text>
+  <text class="svg-label-sm" x="34" y="174">v1 spec cannot be met.</text>
+
+  <text class="svg-label" x="378" y="52">left-click</text>
+  <line x1="442" y1="48" x2="532" y2="48" stroke="#b4532a" stroke-width="1.4" marker-end="url(#a2)"/>
+  <text class="svg-mono" x="542" y="51">Activate()</text>
+  <text class="svg-label" x="378" y="86">right-click</text>
+  <line x1="448" y1="82" x2="532" y2="82" stroke="#b4532a" stroke-width="1.4" marker-end="url(#a2)"/>
+  <text class="svg-mono" x="542" y="85">ContextMenu()</text>
+  <text class="svg-label" x="378" y="120">middle-click</text>
+  <line x1="454" y1="116" x2="532" y2="116" stroke="#b4532a" stroke-width="1.4" marker-end="url(#a2)"/>
+  <text class="svg-mono" x="542" y="119">2ndActivate()</text>
+  <rect x="378" y="142" width="300" height="40" rx="7" fill="#eaf3ed" stroke="#c2ddcc"/>
+  <text class="svg-label" x="390" y="159">All three gestures distinct.</text>
+  <text class="svg-label-sm" x="390" y="174">Requires ItemIsMenu = false.</text>
+
+  <defs>
+    <marker id="a1" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#7a746a"/></marker>
+    <marker id="a2" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#b4532a"/></marker>
+  </defs>
+</svg>
+<figcaption>Why the tray backend choice decides whether the v1 interaction spec is reachable at all. Directional
+illustration of the click-routing difference described above.</figcaption>
+</figure>
+</article>
+
+<article class="idea" id="i2">
+<div class="idea-head"><span class="rank">2</span><h3>Two-Layer State: Modules Actuate, Config Persists</h3></div>
+<div class="chips">
+  <span class="chip ac">State &amp; persistence</span>
+  <span class="chip hi">Confidence 90%</span>
+  <span class="chip md">Complexity Medium</span>
+</div>
+
+<dl class="fields">
+<dt>Description</dt>
+<dd><p>Five independent ideation frames all converged on the same architectural fork — "write a PipeWire filter-chain
+config file" versus "load a module at runtime, like NoiseTorch does" — and all five framed it as a choice. Verification
+says it is not a choice, because each mechanism can only do half the job.</p>
+<p>The config file is <strong>durable but inert</strong>: PipeWire reads
+<code>~/.config/pipewire/filter-chain.conf.d/</code> once at daemon start. There is no file watcher and no
+<code>pw-cli reload</code> command. Writing a config and expecting a filter to appear does nothing until the daemon
+restarts. The runtime module is <strong>immediate but volatile</strong>: it applies the instant it loads and vanishes
+when PipeWire restarts.</p>
+<p>So use both, deliberately. The config file is the <strong>declared</strong> state — the user's intent, written on
+every change, hand-editable, surviving reboot. Runtime module loading is the <strong>actuation</strong> — what makes a
+toggle take effect this second. A reconciler compares declared state against the live graph on startup, on PipeWire
+restart, and on device change, then loads whatever is missing. The config file makes the app's absence safe; the module
+load makes the app's presence responsive.</p></dd>
+
+<dt>Axis</dt>
+<dd>State &amp; persistence</dd>
+
+<dt>Basis</dt>
+<dd><p><code>direct:</code> <code>pw-cli help</code> lists <code>load-module</code>, <code>unload-module</code>,
+<code>set-param</code>, <code>destroy</code> — and no <code>reload</code>. Config under
+<code>filter-chain.conf.d/</code> is read at daemon startup only; applying a change otherwise requires
+<code>systemctl --user restart pipewire</code>.</p>
+<p><code>direct:</code> the runtime path is proven live on this machine right now —
+<code>pactl list modules short</code> shows <code>module-ladspa-source ... plugin=/usr/lib/ladspa/librnnoise_ladspa.so
+control=95</code>, loaded, immediate, and still present after the loading process exited.</p>
+<p><code>direct:</code> <code>module-ladspa-source</code> is authored by Wim Taymans, PipeWire's lead — the
+PulseAudio-protocol path here <em>is</em> a native PipeWire mechanism, not a compatibility shim to be avoided.</p>
+<p><code>external:</code> the desired-state / observed-state reconciler is the Kubernetes controller pattern; it is
+the standard answer to "the world drifts and my declaration must win."</p></dd>
+
+<dt>Rationale</dt>
+<dd>This resolves the single most contested question in the candidate set, and it resolves it by rejecting the framing
+rather than picking a side. It also silently fixes several separate problems: PipeWire restarts no longer kill the
+filter invisibly, the app can exit without the filter dying, a power user can hand-edit the config, and "what should
+be on" has exactly one source of truth instead of being implicit in whatever modules happen to be loaded.</dd>
+
+<dt>Downsides</dt>
+<dd>Two representations of the same intent means a translation layer and a real risk of drift between them — the
+reconciler has to be genuinely correct, not best-effort. Config written by the app but only honored at next daemon
+start creates a window where the file and the graph disagree legitimately, and the UI must not present that as an
+error. Unloading modules the app did not load is a footgun worth guarding against.</dd>
+</dl>
+
+<figure>
+<svg viewBox="0 0 700 240" role="img" aria-label="Declared state in a config file reconciled against live PipeWire graph state via runtime module loading">
+  <rect x="6" y="30" width="200" height="76" rx="9" fill="#fdf0e8" stroke="#eccdb9"/>
+  <text class="svg-title" x="20" y="52">Declared state</text>
+  <text class="svg-mono" x="20" y="70">filter-chain.conf.d/</text>
+  <text class="svg-label-sm" x="20" y="86">durable · hand-editable</text>
+  <text class="svg-label-sm" x="20" y="99">read only at daemon start</text>
+
+  <rect x="250" y="46" width="200" height="60" rx="9" fill="#f4f2ee" stroke="#d2ccbf"/>
+  <text class="svg-title" x="264" y="70">Reconciler</text>
+  <text class="svg-label-sm" x="264" y="88">on start · on PW restart · on hotplug</text>
+
+  <rect x="494" y="30" width="200" height="76" rx="9" fill="#eaf3ed" stroke="#c2ddcc"/>
+  <text class="svg-title" x="508" y="52">Live graph</text>
+  <text class="svg-mono" x="508" y="70">module-ladspa-source</text>
+  <text class="svg-label-sm" x="508" y="86">immediate · volatile</text>
+  <text class="svg-label-sm" x="508" y="99">survives app exit</text>
+
+  <line x1="206" y1="72" x2="244" y2="72" stroke="#b4532a" stroke-width="1.5" marker-end="url(#b1)"/>
+  <text class="svg-label-sm" x="204" y="40">reads intent</text>
+  <line x1="450" y1="72" x2="488" y2="72" stroke="#b4532a" stroke-width="1.5" marker-end="url(#b1)"/>
+  <text class="svg-label-sm" x="440" y="40">loads what is missing</text>
+  <path d="M594,112 C594,140 350,142 350,116" fill="none" stroke="#7a746a" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#b2)"/>
+  <text class="svg-label-sm" x="404" y="146">observes actual</text>
+
+  <rect x="140" y="168" width="420" height="52" rx="8" fill="#fbf3df" stroke="#e8d9ac"/>
+  <text class="svg-label" x="156" y="189">Neither layer alone is sufficient:</text>
+  <text class="svg-label-sm" x="156" y="207">config without reload never activates · modules without config never survive.</text>
+
+  <defs>
+    <marker id="b1" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#b4532a"/></marker>
+    <marker id="b2" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#7a746a"/></marker>
+  </defs>
+</svg>
+<figcaption>The two mechanisms are complementary halves, not competing options. Directional illustration of the
+reconciler relationship described above.</figcaption>
+</figure>
+</article>
+
+<article class="idea" id="i3">
+<div class="idea-head"><span class="rank">3</span><h3>Device Identity, Not Device Names</h3></div>
+<div class="chips">
+  <span class="chip ac">Device lifecycle</span>
+  <span class="chip hi">Confidence 88%</span>
+  <span class="chip md">Complexity Medium</span>
+</div>
+
+<dl class="fields">
+<dt>Description</dt>
+<dd><p>NoiseTorch persists <code>LastUsedInput</code> as a PipeWire node name — a string that encodes the PCI path,
+the ALSA profile, and the port. Change USB ports, switch an ALSA profile, re-pair a Bluetooth headset, and that string
+no longer refers to anything. Persist hardware identity instead: <code>device.vendor.id</code>,
+<code>device.product.id</code>, <code>device.bus</code>, <code>alsa.card_name</code>, plus the serial when the device
+exposes one. Match on reconnect by identity, then resolve to whatever node name the device has this time.</p>
+<p>Once identity is the key, "remember my settings" becomes per-device rather than global: the Razer stays filtered at
+threshold 95, the laptop mic gets a different threshold, the Bluetooth headset is excluded entirely — and each one
+reapplies automatically when it reappears. The mic list stops being a live enumeration and becomes remembered devices,
+present or absent, with an explicit <em>disconnected</em> state instead of silently vanishing.</p></dd>
+
+<dt>Axis</dt>
+<dd>Device lifecycle</dd>
+
+<dt>Basis</dt>
+<dd><p><code>direct:</code> this failure is already on disk. NoiseTorch's config holds
+<code>LastUsedInput = "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source"</code>, and that
+node does not exist in the current graph — grepping it in <code>pactl list short sources</code> exits 1 with zero
+matches.</p>
+<p><code>direct:</code> the same dead name is what the orphaned <code>module-ladspa-source</code> is still pointed at,
+which is why the zombie exists at all — name-keyed state and the zombie are the same bug seen from two ends.</p>
+<p><code>direct:</code> PipeWire node properties expose <code>device.vendor.id</code>,
+<code>device.product.id</code>, <code>device.bus</code>, and <code>alsa.card_name</code> — stable identity is already
+available, just unused.</p>
+<p><code>external:</code> NetworkManager keys connection profiles to interface MAC rather than <code>eth0</code>;
+kanshi and autorandr key display layouts to EDID rather than <code>DP-1</code>. Both solved this exact class of bug by
+moving from position-names to identity.</p></dd>
+
+<dt>Rationale</dt>
+<dd>"Remember the setting so it survives restarts" is a v1 requirement, and the naive implementation of it is already
+demonstrably broken on the target machine before a line of the rewrite is written. Getting the persistence key right
+is nearly free at greenfield and expensive to retrofit, because it changes the shape of the config file, the mic list
+model, and the hotplug handler simultaneously.</dd>
+
+<dt>Downsides</dt>
+<dd>Identity is not perfectly stable either — two identical USB mics of the same model are indistinguishable without a
+serial, and some devices report none. Bluetooth identity is MAC-based and survives re-pairing, but a profile switch
+(HSP versus A2DP) changes the node beneath the same device. Needs a defined tiebreak and a fallback to name matching
+rather than pretending identity is absolute.</dd>
+</dl>
+</article>
+
+<article class="idea" id="i4">
+<div class="idea-head"><span class="rank">4</span><h3>Own the Default at the Metadata Layer</h3></div>
+<div class="chips">
+  <span class="chip ac">Device lifecycle</span>
+  <span class="chip hi">Confidence 90%</span>
+  <span class="chip hi">Complexity Low</span>
+</div>
+
+<dl class="fields">
+<dt>Description</dt>
+<dd><p>The spec says selecting a mic should automatically set it as the Linux default. The obvious implementation —
+<code>pactl set-default-source</code> — is the wrong layer and will be overruled. WirePlumber's default-node policy
+re-evaluates candidates and gives the node named in the <code>default.configured.audio.source</code> metadata a
++30000 priority boost, which dwarfs every ordinary priority. Write that metadata key instead
+(<code>pw-metadata</code> / the metadata API) and WirePlumber's policy becomes the mechanism enforcing your choice
+rather than the thing fighting it.</p>
+<p>Worth pairing with a deliberate consent moment: hijacking the system default microphone is an invasive act, and an
+app that does it silently on first launch is the app users uninstall. Ask once, then own it.</p></dd>
+
+<dt>Axis</dt>
+<dd>Device lifecycle</dd>
+
+<dt>Basis</dt>
+<dd><p><code>direct:</code> <code>/usr/share/wireplumber/scripts/default-nodes/find-selected-default-node.lua</code>,
+lines 54-55: <code>if current_configured_node == name then priority = 30000 + priority</code>.</p>
+<p><code>direct:</code> live on this machine, <code>pw-metadata -n default</code> returns
+<code>default.configured.audio.source = '{"name":"NoiseTorch Microphone for Razer Seiren Mini"}'</code> — a stale
+NoiseTorch source that no longer exists, still sitting in the metadata primed to win the moment a node with that name
+appears.</p>
+<p><code>external:</code> Android's audio-routing consent dialog is the reference pattern for "an app is about to
+take over a system-wide input."</p></dd>
+
+<dt>Rationale</dt>
+<dd>Cheapest high-value item on the list — it is a different API call, not a different architecture, and it converts a
+race the app would lose into a policy the app wins. The stale key sitting in metadata right now also proves the
+cleanup obligation: whatever you write, you must be able to unwrite when the filter is turned off.</dd>
+
+<dt>Downsides</dt>
+<dd>Writing WirePlumber's configured-default is genuinely persistent system state that outlives the app, so "turn the
+filter off" must also mean "restore the previous configured default" — and the app has to record what that was. It is
+also policy-version-coupled: WirePlumber's default-node scripts are Lua on disk and have been reorganized between
+releases, so the key name is stable but the surrounding policy is not guaranteed to be.</dd>
+</dl>
+</article>
+
+<article class="idea" id="i5">
+<div class="idea-head"><span class="rank">5</span><h3>Live Knobs — Params Without Reload</h3></div>
+<div class="chips">
+  <span class="chip ac">Filter engine</span>
+  <span class="chip md">Confidence 80%</span>
+  <span class="chip hi">Complexity Low</span>
+</div>
+
+<dl class="fields">
+<dt>Description</dt>
+<dd><p>NoiseTorch's threshold slider requires unloading and reloading the filter — audio drops out for the duration,
+and any app holding the source may or may not recover. PipeWire's filter-graph implementation accepts
+<code>SPA_PARAM_Props</code> containing named control-port values and pushes them into the live DSP handles without
+touching the graph. The threshold becomes a real-time control: drag it while talking and hear the change.</p>
+<p>The broader shape: separate parameters that can change live (control-port values) from parameters that require a
+rebuild (channel count, plugin choice, master device). Only the second class needs the disruptive path, and the UI
+should make the distinction invisible by never rebuilding when it doesn't have to.</p></dd>
+
+<dt>Axis</dt>
+<dd>Filter engine</dd>
+
+<dt>Basis</dt>
+<dd><p><code>direct:</code> PipeWire <code>spa/plugins/filter-graph/filter-graph.c</code> handles
+<code>SPA_PARAM_Props</code> with a <code>params</code> struct by calling
+<code>port_id_set_control_value()</code> across the DSP handles — the live-update path exists in the daemon.</p>
+<p><code>direct:</code> the invocation shape is
+<code>pw-cli s &lt;node-id&gt; Props '{ params = [ "VAD Threshold (%)" 80 ] }'</code>, and the filter nodes on this
+machine expose <code>Props</code> (id 2) as a writable param.</p>
+<p><code>reasoned:</code> control-port writes mutate a coefficient in place; they do not reallocate the graph, so
+there is no structural reason for a dropout — unlike module reload, which tears down and rebuilds every link.</p></dd>
+
+<dt>Rationale</dt>
+<dd>Turns the most-touched control in the app from a jarring operation into a continuous one, and it is a small
+change — a param write instead of an unload/load pair. It also removes the strongest argument for keeping the
+threshold slider out of v1.</dd>
+
+<dt>Downsides</dt>
+<dd>Runtime param writes are not persistent — they revert when PipeWire restarts, so the value must also be written to
+declared state (see idea 2) or it silently reverts. Verification confirmed the mechanism but could not confirm
+audible smoothness without disrupting live audio: whether a mid-stream coefficient change produces a click is
+unmeasured and should be tested early. Control-port names are plugin-specific strings, so swapping denoisers
+(idea 6) changes the parameter vocabulary.</dd>
+</dl>
+</article>
+
+<article class="idea" id="i6">
+<div class="idea-head"><span class="rank">6</span><h3>The Denoiser Is a Config Field</h3></div>
+<div class="chips">
+  <span class="chip ac">Filter engine</span>
+  <span class="chip hi">Confidence 85%</span>
+  <span class="chip hi">Complexity Low</span>
+</div>
+
+<dl class="fields">
+<dt>Description</dt>
+<dd><p>NoiseTorch hardcodes RNNoise: the <code>.so</code> is embedded in the binary and the filter graph is built
+around it. Treat the denoiser as data instead — a <code>plugin</code> path plus a <code>label</code> plus a control
+map in the declared state. RNNoise is the default because it is cheap and shipped; DeepFilterNet becomes a
+two-field change rather than a fork of the audio engine.</p>
+<p>The identity of the app stops being "the RNNoise app" and becomes "the mic filtering app," which is a materially
+larger product for approximately no additional code — as long as the graph builder never assumes a specific plugin's
+port layout.</p></dd>
+
+<dt>Axis</dt>
+<dd>Filter engine</dd>
+
+<dt>Basis</dt>
+<dd><p><code>direct:</code> DeepFilterNet ships <code>libdeep_filter_ladspa.so</code> with labels
+<code>deep_filter_mono</code> and <code>deep_filter_stereo</code>, packaged on the AUR as
+<code>deepfilternet-plugin-pipewire-bin</code> — same LADSPA interface RNNoise uses, so the same graph shape hosts
+both.</p>
+<p><code>direct:</code> the module loaded on this machine already carries the plugin as an argument —
+<code>plugin=/usr/lib/ladspa/librnnoise_ladspa.so ... label=noise_suppressor_mono</code>. The parameterization point
+exists; nothing is exploiting it.</p>
+<p><code>direct:</code> PipeWire's LADSPA loader branches on <code>plugin[0] != '/'</code>, searching
+<code>LADSPA_PATH</code> for bare names and calling <code>dlopen()</code> directly on absolute paths — so a bundled
+<code>.so</code> at an arbitrary path is loadable without touching environment variables.</p>
+<p><code>reasoned:</code> DeepFilterNet's quality advantage is real but it costs roughly an order of magnitude more
+CPU than RNNoise; on a 12-core Ultra 5 that is affordable, on older hardware it is not. Which makes it exactly the
+kind of decision that belongs to the user's config rather than to the binary.</p></dd>
+
+<dt>Rationale</dt>
+<dd>The cost is paid once, at the moment the graph builder is written, and only if it is written to be
+plugin-agnostic. Retrofitting plugin-independence after the graph builder has RNNoise's port layout baked into it is
+a rewrite of the core. This is the classic case for spending a little structure early.</dd>
+
+<dt>Downsides</dt>
+<dd>Different plugins expose different control ports, so any UI beyond a generic list of named controls has to be
+plugin-aware anyway — a hardcoded "Threshold" slider does not survive the swap. DeepFilterNet is not in Arch's
+official repos, so anything beyond RNNoise means either an AUR dependency or bundling a much larger artifact. Genuine
+scope risk: this is the idea most likely to grow into a plugin framework nobody asked for.</dd>
+</dl>
+</article>
+
+<article class="idea" id="i7">
+<div class="idea-head"><span class="rank">7</span><h3>antibising-core — Headless Engine, Native Registry</h3></div>
+<div class="chips">
+  <span class="chip ac">Distribution &amp; install</span>
+  <span class="chip md">Confidence 72%</span>
+  <span class="chip md">Complexity High</span>
+</div>
+
+<dl class="fields">
+<dt>Description</dt>
+<dd><p>Put every audio decision — enumeration, identity matching, graph construction, reconciliation, health checking
+— in a plain Rust crate with no Tauri dependency and no UI concepts. The Tauri app becomes a consumer of it, and so
+can a CLI, a systemd user service, and a test harness that drives the engine without a display server.</p>
+<p>Inside that crate, talk to PipeWire through the <code>pipewire</code> crate's Registry rather than shelling out to
+<code>pactl</code>. Registry emits a <code>global</code> event per object and <code>global_remove</code> on
+disappearance — which is precisely the hotplug notification the spec's "automatic refresh when a mic is plugged or
+unplugged" requires, and which parsing <code>pactl</code> output cannot give you without polling.</p></dd>
+
+<dt>Axis</dt>
+<dd>Distribution &amp; install</dd>
+
+<dt>Basis</dt>
+<dd><p><code>direct:</code> the <code>pipewire</code> crate's registry documentation — "globals come and go as a result
+of device hotplugs or reconfiguration or other events, and the registry will send out <code>global</code> and
+<code>global_remove</code> events to keep the client up to date." Maintained by the PipeWire project itself.</p>
+<p><code>direct:</code> <code>pactl subscribe</code> produced no output across a two-second idle sample — it is an
+event stream with long silences, so a shell-out design degrades into either a long-lived parsed subprocess or a
+polling loop.</p>
+<p><code>direct:</code> NoiseTorch's device list "is populated once on PulseAudio connect and never refreshed until
+disconnect/reconnect" — the reference implementation's hotplug story is that it does not have one, which is exactly
+what the v1 spec calls out as a requirement.</p>
+<p><code>reasoned:</code> the engine is where every hard-to-reproduce bug in this app will live — zombie filters,
+hotplug races, reconciliation drift. Those are only testable if they can be driven without a webview.</p></dd>
+
+<dt>Rationale</dt>
+<dd>This is the leverage item: it does not deliver a user-visible feature, it makes ideas 2, 3, and 5 implementable
+and testable rather than aspirational. Ranked last because it is the one direction whose value is entirely downstream
+— if v1 turns out to be a weekend tool for one machine, this is over-investment.</dd>
+
+<dt>Downsides</dt>
+<dd>Highest implementation burden on the list, and the <code>pipewire</code> crate is a thinner, less-documented
+surface than shelling out to <code>pactl</code> — verification noted its docs.rs build is broken, so the API must be
+learned from source. Async lifetime management around Registry listeners in Rust is genuinely fiddly. A crate boundary
+drawn before the shape of the problem is known can become a boundary in the wrong place.</dd>
+</dl>
+</article>
+</section>
+
+<section id="rejections">
+<h2>Rejection Summary</h2>
+
+<p>Forty-one candidates were generated across six frames; two were refuted outright by live verification, and the
+rest were either folded into a stronger survivor or cut. Two clusters were produced independently by four of the five
+frames each — the tray mechanism and the config-versus-module question — which is why both became survivors rather
+than being deduplicated away.</p>
+
+<h4>Refuted by verification</h4>
+<table>
+<thead><tr><th>#</th><th>Idea</th><th>Reason rejected</th></tr></thead>
+<tbody>
+<tr><td>16</td><td>Source replacement — rename the original node so the filtered one inherits its name</td>
+<td><code>node.name</code> is immutable after registration; <code>pw_impl_node_register()</code> sets it once and no
+API updates it. Unregister/re-register would destroy every existing link.</td></tr>
+<tr><td>33</td><td>Fork NoiseTorch instead of rewriting</td>
+<td>The installed binary connects to PipeWire 1.6.8 and enumerates zero sources — the version gate
+(<code>major &lt;= 0</code>) does not even fire on 1.6.8, so the breakage is deeper, in the vendored PulseAudio
+protocol library. Combined with Go + X11/xgbutil, the <code>setcap</code> requirement, and dead update
+infrastructure, a fork is not cheaper.</td></tr>
+</tbody>
+</table>
+
+<h4>Folded into a stronger survivor</h4>
+<table>
+<thead><tr><th>#</th><th>Idea</th><th>Reason rejected</th></tr></thead>
+<tbody>
+<tr><td>5, 13</td><td>Bypass libappindicator via ksni; direct SNI with own D-Bus lifecycle</td><td>Duplicates — these are the mechanism of survivor 1.</td></tr>
+<tr><td>6</td><td>Re-register the SNI item when the tray host restarts</td><td>A correctness detail of survivor 1, not a direction of its own.</td></tr>
+<tr><td>10</td><td>Window-less, tray-only v1</td><td>Contradicts the stated spec (clicking the tray opens a window); the useful part — the window is optional, not the app — is inside survivor 1.</td></tr>
+<tr><td>32</td><td>The Tauri webview is not paying for its dinner</td><td>A cost observation, not an actionable direction; the framework is already chosen.</td></tr>
+<tr><td>9, 15, 20, 40</td><td>Config-file-first app; install = write config; write HOCON instead of load-module; exit after writing config</td><td>All assume file-write activates a filter. Verified false — <code>filter-chain.conf.d</code> is read at daemon start only and there is no <code>pw-cli reload</code>. The durable half survives inside idea 2.</td></tr>
+<tr><td>12, 35, 41</td><td>Filters outlive the app; permanent virtual source with the app as router; sandboxed engine that never touches config</td><td>Each picks one layer of the two-layer model in idea 2.</td></tr>
+<tr><td>24</td><td>Kubernetes-style reconciliation controller</td><td>Right pattern, wrong mechanism as originally stated (it assumed hot-reloadable config); the corrected version is the reconciler in idea 2.</td></tr>
+<tr><td>2</td><td>PipeWire restart kills the filter invisibly</td><td>The problem idea 2's reconciler exists to solve.</td></tr>
+<tr><td>1, 4</td><td>Zombie detector; graceful degradation when a device vanishes</td><td>The health-check half of survivor 1 and the disconnected-state half of survivor 3.</td></tr>
+<tr><td>8, 25, 26, 31</td><td>Config loads a dead device; NetworkManager-style profiles; kanshi-style device-set matching; profiles not mics</td><td>Four framings of one idea — identity-keyed persistence, survivor 3.</td></tr>
+<tr><td>11</td><td>Auto-follow the default source, no selection UI</td><td>Removes the mic-selection requirement the spec explicitly asks for; the auto-reapply behavior survives in idea 3.</td></tr>
+<tr><td>27</td><td>Consent dialog before taking the system default</td><td>The UX half of survivor 4.</td></tr>
+<tr><td>22</td><td>Never cache — query PipeWire on every read</td><td>Registry events already provide correctness without the waste; superseded by idea 7.</td></tr>
+<tr><td>17, 18, 19, 23</td><td>Native Registry over pactl; core crate; hand-editable declarative config; bundle the .so via <code>include_bytes!</code></td><td>17 and 18 are survivor 7; 19 is the config layer of idea 2; 23 is a packaging tactic verified sound but too small to rank alone.</td></tr>
+<tr><td>21, 38, 39</td><td>Configurable filter graph; dual-source zero-latency monitoring; DeepFilterNet everywhere</td><td>21 is survivor 6; 38 and 39 are things survivor 6 makes possible, not separate directions.</td></tr>
+</tbody>
+</table>
+
+<h4>Cut outright</h4>
+<table>
+<thead><tr><th>#</th><th>Idea</th><th>Reason rejected</th></tr></thead>
+<tbody>
+<tr><td>14</td><td>Filter every active source, eliminate selection</td><td>CPU is affordable (~9-15% of one core for three sources) but it is a UX regression against the spec — filtering a Bluetooth headset the user did not choose is worse than asking.</td></tr>
+<tr><td>28</td><td>systemd template unit per microphone</td><td>Too expensive relative to value; unit install, enable/disable, and restart orchestration to achieve what a config file already achieves.</td></tr>
+<tr><td>29</td><td>Git <code>includeIf</code>-style conditional config inclusion</td><td>The analogy does not map — device matching is a lookup, not a config-merge problem.</td></tr>
+<tr><td>30</td><td>JACK/Carla patchbay-style connection graph persistence</td><td>Value is as a mental model only; the persistence mechanism it proposes is idea 2's config layer.</td></tr>
+<tr><td>34</td><td>This is a personal tool, not a product</td><td>Scope framing rather than an idea — a decision to make, not a direction to explore.</td></tr>
+<tr><td>36</td><td>Hardcode the author's three mics</td><td>Fragile in exactly the way survivor 3 exists to prevent; the three-device count is already unstable (one is Bluetooth, one is a zombie).</td></tr>
+<tr><td>37</td><td>Distribution is the whole product at 1M users</td><td>Not grounded in the stated v1 scope; a real concern deferred, not a v1 direction.</td></tr>
+</tbody>
+</table>
+
+<p>All five axes carry at least one survivor. Distribution &amp; install is the thinnest — its only survivor (7) is
+ranked last and is infrastructural, because the packaging-heavy candidates were all either scope overruns for a v1 on
+one machine or tactics too small to rank.</p>
+</section>
+
+<footer class="composition-signal">
+Composed 2026-07-27 by ce-ideate from the user's v1 spec for a Tauri v2 rewrite of NoiseTorch-ng, grounded against
+<code>../nt/</code> and the live audio stack on this machine.
+</footer>
+
+</div>
+</body>
+</html>
