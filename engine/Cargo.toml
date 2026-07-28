@@ -1,0 +1,16 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pipewire = "0.10"
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "1"
+tracing = "0.1"
+
+[[bin]]
+name = "engine-cli"
+path = "src/bin/engine_cli.rs"
