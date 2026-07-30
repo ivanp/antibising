@@ -526,27 +526,33 @@ fn missing_fragment_is_regenerated_on_next_start() {
 /// `pipewire.service` alongside it) is repeatedly canceled by systemd
 /// ("Job for pipewire.socket canceled") regardless of stop ordering,
 /// splitting into separate invocations, or removing this daemon's own
-/// `Upholds=` drop-in first. The live desktop session's own dependency
+/// `Upholds=` drop-in first. The live desktop session's dependency
 /// closure (wireplumber, pipewire-pulse, sway-session.target, and
 /// ~15 further running services under `sockets.target`) transitively
-/// requires `pipewire.socket`, so systemd's own dependency resolution
-/// actively fights a `--user` stop of it while the session is up — this
-/// is not a bug in the test's stop sequence. A logout-free, disruption-
-/// free reproduction of this scenario would need either a dedicated
-/// test systemd user session or `systemctl isolate`-level intervention,
-/// out of proportion to what U3 needs to prove; left for a session
-/// where the user is prepared for a full graphical-session interruption
-/// to investigate further, or a redesign that verifies the daemon-vs-
-/// pipewire.service ordering without also tearing down the socket.
-/// Deferred, not passing — do not treat this scenario as covered.
+/// requires `pipewire.socket` — observed via `systemctl --user
+/// list-dependencies pipewire.socket --reverse`. The exact mechanism
+/// linking that dependency closure to the repeated cancellation is
+/// **not confirmed**; only the cancellation itself and the dependency
+/// closure's existence were directly observed, not a proven causal
+/// chain between them. A logout-free, disruption-free reproduction of
+/// this scenario would need either a dedicated test systemd user
+/// session or `systemctl isolate`-level intervention, out of
+/// proportion to what U3 needs to prove; left for a session where the
+/// user is prepared for a full graphical-session interruption to
+/// investigate the actual cause further, or a redesign that verifies
+/// the daemon-vs-pipewire.service ordering without also tearing down
+/// the socket. Deferred, not passing — do not treat this scenario as
+/// covered, and do not treat the dependency-closure explanation above
+/// as a proven root cause.
 ///
 /// Destructive: stops the user's real `pipewire.service` (silences all
 /// audio on this machine until PipeWire restarts, which happens as
 /// part of this test). Gated behind `ANTIBISING_DESTRUCTIVE_TESTS=1`.
 #[test]
-#[ignore = "DEFERRED, not passing: pipewire.socket stop is fought by the live desktop \
-session's own dependency closure (wireplumber/pipewire-pulse/sway-session.target and ~15 \
-other running services) -- see the scenario's doc comment for four failed live attempts. \
+#[ignore = "DEFERRED, not passing: repeated cancellations occurred when stopping \
+pipewire.socket in this active graphical session (wireplumber/pipewire-pulse/ \
+sway-session.target and ~15 other running services depend on it), despite four attempted \
+stop-sequence variations; precise cause remains unresolved -- see the scenario's doc comment. \
 Needs a session-teardown-tolerant environment (dedicated test session or systemctl isolate) \
 to investigate further; do not run casually against a live desktop session."]
 fn boot_order_starts_pipewire_before_daemon_without_restart_loop() {
@@ -985,4 +991,61 @@ fn current_source_serial() -> Option<String> {
         }
     }
     None
+}
+
+/// Verifies `DropinGuard`'s restore mechanics in isolation, using a
+/// scratch file -- **not** `InstallTestRig`/`uninstall()`, which would
+/// remove the real drop-in unconditionally on cleanup and make it
+/// impossible to tell "the guard restored it" apart from "cleanup
+/// removed it regardless." Exercises both the explicit `restore()` path
+/// and the panic-path `Drop` fallback against a real file (this is the
+/// one live `systemctl --user daemon-reload` call this test performs --
+/// harmless and idempotent, touches no drop-in content) so the ordering
+/// invariant (guard exists *before* the file is removed) and both
+/// restore paths are covered by something other than "the boot-order
+/// scenario happened to leave the machine clean."
+#[test]
+#[ignore = "live systemd/PipeWire test — real, persistent system changes; run with --ignored, with the user present and consenting"]
+fn dropin_guard_restores_content_on_explicit_restore_and_on_panic() {
+    let dir = std::env::temp_dir().join(format!(
+        "antibising-dropinguard-unittest-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = dir.join("scratch-dropin.conf");
+    let original_content = "# original content\n[Unit]\nUpholds=scratch.service\n";
+
+    // Case 1: explicit restore() path.
+    std::fs::write(&scratch, original_content).unwrap();
+    let guard = DropinGuard::new(&scratch);
+    assert!(!scratch.exists(), "DropinGuard::new should have removed the file");
+    guard.restore();
+    assert_eq!(
+        std::fs::read_to_string(&scratch).unwrap(),
+        original_content,
+        "restore() should write back the exact original content"
+    );
+
+    // Case 2: panic-path Drop fallback. Construct the guard inside a
+    // std::panic::catch_unwind so the panic propagates through Drop
+    // without aborting this test process, proving the Drop impl itself
+    // (not merely the explicit restore() call) performs the restore.
+    std::fs::write(&scratch, original_content).unwrap();
+    let result = std::panic::catch_unwind(|| {
+        let _guard = DropinGuard::new(&scratch);
+        panic!("simulated failure between removal and explicit restore");
+    });
+    assert!(result.is_err(), "the simulated panic should have propagated");
+    assert_eq!(
+        std::fs::read_to_string(&scratch).unwrap(),
+        original_content,
+        "Drop's best-effort restore should have written back the exact original content \
+         even though the panic prevented the explicit restore() call from ever running"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }
