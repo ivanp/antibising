@@ -10,17 +10,25 @@
 //! - `run`       — what systemd's `ExecStart=` actually invokes. Assumes
 //!                 installation already happened (by definition, since
 //!                 something started this unit) and runs Q4 startup
-//!                 reconciliation before hosting the engine session.
+//!                 reconciliation, loads the persisted config (U5/KTD6),
+//!                 and starts the U10 IPC server before hosting the
+//!                 engine session.
 //!
 //! U3's scope stops at making startup safe in the four Q4 states and
-//! shutting down cleanly on SIGTERM. The IPC socket (U10) and the fuller
-//! adopt/repair lifecycle across a live PipeWire crash (U9) are separate
-//! units — `run` here hosts the engine and keeps routing alive, which is
-//! already enough for R1/R3 to hold with no UI process attached.
+//! shutting down cleanly on SIGTERM. The fuller adopt/repair lifecycle
+//! across a live PipeWire crash (U9) is a separate unit — `run` here
+//! hosts the engine and keeps routing alive, which is already enough for
+//! R1/R3 to hold with no UI process attached.
 
-use engine::{classify_startup, install, is_unit_active, uninstall, InstallPaths, StartupAction};
+use antibisingd::ipc::{
+    accept_loop, bind_singleton, handle_session_event, BindError, Broadcaster, IpcPaths,
+    SharedState,
+};
+use engine::{
+    classify_startup, install, is_unit_active, uninstall, Config, InstallPaths, StartupAction,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const FILTER_CHAIN_UNIT: &str = "filter-chain.service";
@@ -76,26 +84,73 @@ fn cmd_uninstall() {
 }
 
 /// What systemd's `ExecStart=` invokes. Runs Q4 startup reconciliation,
-/// then hosts the engine session thread until SIGTERM, at which point it
-/// shuts the session down cleanly and exits 0.
+/// loads the persisted config (U5/KTD6), applies it to the engine, starts
+/// the U10 IPC server, then hosts the engine session thread until
+/// SIGTERM, at which point it shuts everything down cleanly and exits 0.
 ///
-/// **Default-ranking bootstrap:** U5 hasn't landed yet, so there is no
-/// persisted preference order to load. Without *something* in
-/// `preference_order`, `compute_desired_feed` (R3) never picks any
-/// device — a present-but-unranked device is deliberately never chosen
-/// — and the daemon would sit `SilentNoDevice` forever even with a mic
-/// plugged in. Until U5's config exists, every device this daemon
-/// observes (via the initial `Snapshot` or a later `DeviceArrived`) is
-/// appended to a locally-tracked order and pushed with
-/// `SetPreferenceOrder`, so install always reaches `Linked` whenever at
-/// least one recognized device is present — never merely "source node
-/// exists." U5 replaces this with the daemon's own persisted ranking;
-/// this is a deterministic stopgap, not a design decision about final
-/// ranking policy.
+/// **Auto-rank fallback, now persisted.** If the loaded config's
+/// `preference_order` is empty (first run, no user ranking yet — R3's
+/// own rule is that a present-but-unranked device is never chosen, so an
+/// empty order would otherwise sit `SilentNoDevice` forever even with a
+/// mic plugged in), every device this daemon observes is appended to the
+/// config's `preference_order` and the config is saved — so the *next*
+/// daemon start already has a real ranking, and this fallback only ever
+/// engages once per machine rather than every run. A future U7 panel, or
+/// a manual pin, immediately supersedes it (R3: an unpinned
+/// ranked-routing mode is a normal, permanent operating state, not
+/// solely a bootstrap artifact — this fallback simply seeds it).
 fn cmd_run() {
     reconcile_startup();
 
+    let config_path = Config::default_path();
+    let mut config = Config::load(&config_path).unwrap_or_else(|e| {
+        tracing::error!(
+            "failed to load config at {}: {e}; starting from defaults",
+            config_path.display()
+        );
+        Config::default()
+    });
+
     let mut session = engine::Session::spawn(engine::SOURCE_NAME.to_string());
+
+    if !config.preference_order.is_empty() {
+        let ids: Vec<engine::DeviceId> = config
+            .preference_order
+            .iter()
+            .cloned()
+            .map(engine::DeviceId)
+            .collect();
+        let _ = session.send(engine::SessionCommand::SetPreferenceOrder(ids));
+    }
+    if let Some(pin) = &config.pin {
+        let _ = session.send(engine::SessionCommand::SetPin(Some(engine::DeviceId(
+            pin.clone(),
+        ))));
+    }
+
+    let ipc_paths = IpcPaths::production();
+    let (_lock_file, listener) = match bind_singleton(&ipc_paths) {
+        Ok(pair) => pair,
+        Err(BindError::AlreadyRunning) => {
+            tracing::error!("{}", BindError::AlreadyRunning);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            tracing::error!("failed to bind IPC socket: {e}");
+            std::process::exit(1);
+        }
+    };
+    let shared = Arc::new(Mutex::new(SharedState::new(
+        config.clone(),
+        config_path.clone(),
+    )));
+    let broadcaster = Broadcaster::new();
+    let session_cmd_tx = session.command_sender();
+    {
+        let shared = shared.clone();
+        let broadcaster = broadcaster.clone();
+        std::thread::spawn(move || accept_loop(listener, shared, broadcaster, session_cmd_tx));
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown.clone()) {
@@ -106,7 +161,6 @@ fn cmd_run() {
     }
 
     tracing::info!("antibisingd running");
-    let mut known_devices: Vec<engine::DeviceId> = Vec::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
             tracing::info!("shutdown requested, stopping session thread");
@@ -116,55 +170,57 @@ fn cmd_run() {
         match session.try_recv_event() {
             Some(event) => {
                 tracing::debug!(?event, "session event");
-                bootstrap_default_ranking(&session, &mut known_devices, &event);
+                if config.preference_order.is_empty() {
+                    if let Some(order) = update_known_devices(&mut config.preference_order, &event)
+                    {
+                        let ids: Vec<engine::DeviceId> =
+                            order.into_iter().map(engine::DeviceId).collect();
+                        let _ = session.send(engine::SessionCommand::SetPreferenceOrder(ids));
+                        let mut state = shared.lock().expect("shared state mutex poisoned");
+                        state.config.preference_order = config.preference_order.clone();
+                        let content = toml::to_string_pretty(&state.config)
+                            .expect("Config must always serialize to TOML");
+                        let _ = engine::write_atomic(&config_path, &content);
+                    }
+                }
+                handle_session_event(&shared, &broadcaster, event);
             }
             None => std::thread::sleep(Duration::from_millis(100)),
         }
     }
 }
 
-/// See `cmd_run`'s doc comment. Thin I/O wrapper around the pure
-/// [`update_known_devices`] — sends `SetPreferenceOrder` only when that
-/// function says a resend is needed.
-fn bootstrap_default_ranking(
-    session: &engine::Session,
-    known_devices: &mut Vec<engine::DeviceId>,
-    event: &engine::SessionEvent,
-) {
-    if let Some(order) = update_known_devices(known_devices, event) {
-        let _ = session.send(engine::SessionCommand::SetPreferenceOrder(order));
-    }
-}
-
-/// Pure core of the default-ranking bootstrap: updates `known_devices`
-/// per `event`, returning `Some(order)` to resend or `None` if nothing
-/// on the wire needs to change. Kept event-in/state-out so it's
-/// unit-testable without a live `Session`.
+/// Pure core of the persisted auto-rank fallback (see `cmd_run`'s doc
+/// comment): updates `preference_order` per `event`, returning
+/// `Some(order)` to resend/persist or `None` if nothing changed. Kept
+/// event-in/state-out so it's unit-testable without a live `Session`.
+/// Operates on plain `String` device identities (the config's own wire
+/// type) rather than `engine::DeviceId`, so it has zero engine coupling.
 ///
-/// **Why `Disconnected` clears `known_devices`:** `Snapshot` fires once
+/// **Why `Disconnected` clears the working order:** `Snapshot` fires once
 /// per PipeWire *generation* (session.rs's `Generation::new()` on every
 /// initial connect and every reconnect after a crash/restart), and each
-/// fresh generation's `preference_order` starts empty regardless of what
-/// this daemon process previously sent — the engine's per-generation
-/// state is never carried across a reconnect (session.rs: "recovery is
-/// a clean rebuild, not an attempt to reconcile stale IDs with new
-/// ones"). Without clearing on `Disconnected`, the post-reconnect
-/// `Snapshot` would report the *same* devices this process already
-/// knows about, `added` would stay `false`, and `SetPreferenceOrder`
-/// would never be resent to the new (empty-preference-order)
-/// generation — silently breaking R3 routing after every PipeWire
-/// restart, exactly the SIGKILL-recovery scenario R2 exists to cover.
-/// Clearing here means the next `Snapshot` sees every device as newly
-/// known again and resends unconditionally.
+/// fresh generation's engine-side `preference_order` starts empty
+/// regardless of what this daemon process previously sent — the engine's
+/// per-generation state is never carried across a reconnect. Without
+/// clearing here, the post-reconnect `Snapshot` would report the *same*
+/// devices this process already tracked, `added` would stay `false`, and
+/// `SetPreferenceOrder` would never be resent to the new
+/// (empty-preference-order) generation — silently breaking R3 routing
+/// after every PipeWire restart, exactly the SIGKILL-recovery scenario R2
+/// exists to cover. **This function only runs at all while the
+/// *persisted* config's order is still empty** (see the `cmd_run`
+/// call-site guard) — once a real ranking exists, `cmd_run` sends it once
+/// at startup and this fallback never engages again.
 ///
-/// The `Snapshot` devices are sorted by `DeviceId` before appending —
-/// the engine's internal device map is a `HashMap`, so `Snapshot`'s
-/// vector order is not stable across runs; sorting first is what makes
+/// The `Snapshot` devices are sorted by `DeviceId` before appending — the
+/// engine's internal device map is a `HashMap`, so `Snapshot`'s vector
+/// order is not stable across runs; sorting first is what makes
 /// "deterministic across a daemon run" true rather than aspirational.
 fn update_known_devices(
-    known_devices: &mut Vec<engine::DeviceId>,
+    known_devices: &mut Vec<String>,
     event: &engine::SessionEvent,
-) -> Option<Vec<engine::DeviceId>> {
+) -> Option<Vec<String>> {
     match event {
         engine::SessionEvent::Disconnected => {
             known_devices.clear();
@@ -175,15 +231,16 @@ fn update_known_devices(
             sorted_ids.sort();
             let mut added = false;
             for id in sorted_ids {
-                if !known_devices.contains(id) {
-                    known_devices.push(id.clone());
+                let id_str = id.0.clone();
+                if !known_devices.contains(&id_str) {
+                    known_devices.push(id_str);
                     added = true;
                 }
             }
             added.then(|| known_devices.clone())
         }
-        engine::SessionEvent::DeviceArrived(info) if !known_devices.contains(&info.id) => {
-            known_devices.push(info.id.clone());
+        engine::SessionEvent::DeviceArrived(info) if !known_devices.contains(&info.id.0) => {
+            known_devices.push(info.id.0.clone());
             Some(known_devices.clone())
         }
         _ => None,
@@ -200,9 +257,10 @@ fn update_known_devices(
 /// would silently produce no source at all. Regeneration (either here
 /// or in the `RegenerateAndRestart` branch below, which covers the
 /// unit-still-active-but-fragment-corrupted case) writes the fragment
-/// from the daemon's default config — U5's richer config-driven
-/// fragment lands later; U3 only needs the bypass graph to exist — and
-/// retries the unit start exactly once, never looping.
+/// from the daemon's *persisted* config (falling back to
+/// `FragmentConfig::default()` if the config itself is unreadable —
+/// U3's bypass graph must still come up even when U5's config is
+/// corrupt) and retries the unit start exactly once, never looping.
 fn reconcile_startup() {
     let paths = match InstallPaths::production() {
         Ok(p) => p,
@@ -212,12 +270,16 @@ fn reconcile_startup() {
         }
     };
 
+    let fragment_config = Config::load(&Config::default_path())
+        .map(|c| c.to_fragment_config())
+        .unwrap_or_default();
+
     if !paths.fragment_path.exists() {
         tracing::warn!(
-            "startup: fragment missing at {}; regenerating from default config (R7)",
+            "startup: fragment missing at {}; regenerating from config (R7)",
             paths.fragment_path.display()
         );
-        let content = engine::render_fragment(&engine::FragmentConfig::default());
+        let content = engine::render_fragment(&fragment_config);
         if let Err(e) = engine::write_atomic(&paths.fragment_path, &content) {
             tracing::error!("failed to regenerate missing fragment: {e}");
             return;
@@ -241,7 +303,7 @@ fn reconcile_startup() {
                 "startup: {FILTER_CHAIN_UNIT} reports active but source is missing; \
                  regenerating fragment from config and restarting once"
             );
-            let content = engine::render_fragment(&engine::FragmentConfig::default());
+            let content = engine::render_fragment(&fragment_config);
             if let Err(e) = engine::write_atomic(&paths.fragment_path, &content) {
                 tracing::error!("failed to regenerate fragment: {e}");
                 return;
@@ -318,13 +380,13 @@ fn wait_for_source_bool(name: &str, timeout: Duration) -> bool {
 mod tests {
     use super::*;
 
-    fn dev(id: &str) -> engine::DeviceId {
-        engine::DeviceId(id.to_string())
+    fn dev(id: &str) -> String {
+        id.to_string()
     }
 
     fn device_info(id: &str) -> engine::DeviceInfo {
         engine::DeviceInfo {
-            id: dev(id),
+            id: engine::DeviceId(id.to_string()),
             node_id: 0,
             description: id.to_string(),
         }

@@ -33,6 +33,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// Commands sent from outside the session thread (daemon/IPC layer) into it.
+#[derive(Debug)]
 pub enum SessionCommand {
     /// Replace the ranked device preference list (R3). Order matters:
     /// index 0 is highest priority.
@@ -64,6 +65,12 @@ pub enum SessionEvent {
     /// downstream `Linked` health status must drop to `Reconnecting` until
     /// the next `Snapshot` arrives.
     Disconnected,
+    /// The R5 health verdict changed. Emitted from `reconcile_now` only
+    /// when the computed [`crate::model::HealthStatus`] actually differs
+    /// from what was last emitted this generation — U10's IPC layer
+    /// forwards this verbatim to clients rather than re-deriving it, so
+    /// it must never fire on every reconcile tick regardless of change.
+    HealthChanged(crate::model::HealthStatus),
 }
 
 /// How often the pw loop polls for outside commands. Small enough that
@@ -99,6 +106,17 @@ impl Session {
 
     pub fn send(&self, cmd: SessionCommand) -> Result<(), ()> {
         self.cmd_tx.send(cmd).map_err(|_| ())
+    }
+
+    /// A clonable handle to send commands, independent of `&self` — U10's
+    /// IPC layer hands one of these to each client-handling thread so
+    /// multiple clients can issue commands concurrently without
+    /// serializing through a single `&Session` borrow. All commands still
+    /// funnel through the same underlying `mpsc::Sender`, so ordering
+    /// into the session thread is preserved regardless of how many
+    /// senders exist.
+    pub fn command_sender(&self) -> StdSender<SessionCommand> {
+        self.cmd_tx.clone()
     }
 
     /// Receive the next event, blocking. Returns `None` if the session
@@ -165,6 +183,11 @@ struct Generation {
     /// Routing policy state (R3), set via `SessionCommand`.
     preference_order: Vec<DeviceId>,
     pin: Option<DeviceId>,
+    /// The last [`crate::model::HealthStatus`] emitted this generation
+    /// (`None` before the first `reconcile_now` cycle). Dedup state for
+    /// `HealthChanged` — U10's IPC clients need change events, not a
+    /// flood on every debounced reconcile tick.
+    last_health: Option<crate::model::HealthStatus>,
 }
 
 /// A Link global observed on the capture node, as reported by PipeWire —
@@ -195,6 +218,7 @@ impl Generation {
             capture_links: HashMap::new(),
             preference_order: Vec::new(),
             pin: None,
+            last_health: None,
         }
     }
 
@@ -339,6 +363,30 @@ impl Generation {
             if let Some(pod) = pipewire::spa::pod::Pod::from_bytes(&bytes) {
                 node.set_param(pipewire::spa::param::ParamType::Props, 0, pod);
             }
+        }
+    }
+
+    /// Compute the current health verdict (R5, via [`crate::model::compute_health`])
+    /// and emit `HealthChanged` only if it differs from `last_health`.
+    /// Called at the end of every `reconcile_now` cycle — health can
+    /// change even on a `NoOp` reconcile action (e.g. a device that fed
+    /// the desired link just departed, dropping `ActualLink` to `None`
+    /// before the next dirty tick notices).
+    fn emit_health_if_changed(&mut self, event_tx: &StdSender<SessionEvent>) {
+        let actual = self.actual_link();
+        let health = crate::model::compute_health(
+            self.capture_node_id.is_some(),
+            &actual,
+            |id| {
+                self.devices
+                    .values()
+                    .find(|info| &info.id == id)
+                    .map(|info| info.description.clone())
+            },
+        );
+        if self.last_health.as_ref() != Some(&health) {
+            self.last_health = Some(health.clone());
+            let _ = event_tx.send(SessionEvent::HealthChanged(health));
         }
     }
 }
@@ -694,6 +742,7 @@ fn run_one_generation(
     let link_factory_for_timer = link_factory_for_global.clone();
     let dirty_for_timer = dirty_for_global.clone();
     let dirty_for_timer2 = dirty_for_remove.clone();
+    let tx_for_timer = event_tx.clone();
 
     let timer = mainloop.loop_().add_timer(move |_expirations| {
         // Coalesced reconcile: run at most once per tick, after draining
@@ -705,6 +754,7 @@ fn run_one_generation(
                 &mut gen_for_timer.borrow_mut(),
                 &core_for_timer,
                 &link_factory_for_timer,
+                &tx_for_timer,
             );
         }
 
@@ -726,12 +776,12 @@ fn run_one_generation(
                 Ok(SessionCommand::SetPreferenceOrder(order)) => {
                     let mut gen = gen_for_timer.borrow_mut();
                     gen.preference_order = order;
-                    reconcile_now(&mut gen, &core_for_timer, &link_factory_for_timer);
+                    reconcile_now(&mut gen, &core_for_timer, &link_factory_for_timer, &tx_for_timer);
                 }
                 Ok(SessionCommand::SetPin(pin)) => {
                     let mut gen = gen_for_timer.borrow_mut();
                     gen.pin = pin;
-                    reconcile_now(&mut gen, &core_for_timer, &link_factory_for_timer);
+                    reconcile_now(&mut gen, &core_for_timer, &link_factory_for_timer, &tx_for_timer);
                 }
                 Ok(SessionCommand::SetRnnoiseParam(param, value)) => {
                     gen_for_timer.borrow().set_rnnoise_param(param, value);
@@ -951,10 +1001,17 @@ fn reconcile_now(
     gen: &mut Generation,
     core: &CoreRc,
     link_factory: &Rc<RefCell<Option<String>>>,
+    event_tx: &StdSender<SessionEvent>,
 ) {
     let capture_node_id = match gen.capture_node_id {
         Some(id) => id,
-        None => return, // U2's fragment not up yet; nothing to link.
+        None => {
+            // U2's fragment not up yet; nothing to link, but health can
+            // still change (e.g. dropping from Linked to Broken if the
+            // capture node just departed) — still worth an emit.
+            gen.emit_health_if_changed(event_tx);
+            return;
+        }
     };
 
     let present = gen.present_devices();
@@ -983,6 +1040,8 @@ fn reconcile_now(
             converge_capture_links(gen, core, link_factory, &device_id, capture_node_id)
         }
     }
+
+    gen.emit_health_if_changed(event_tx);
 }
 
 /// Destroy every observed link on the capture node, by real Link global

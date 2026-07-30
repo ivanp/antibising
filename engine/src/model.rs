@@ -66,6 +66,53 @@ pub enum HealthStatus {
     Reconnecting,
 }
 
+/// Compute the health verdict from what the reconciler actually observes
+/// (`ActualLink`, `reconcile.rs`) plus whether the capture node itself
+/// exists yet. Pure and total — no PipeWire I/O — so the daemon's IPC
+/// snapshot logic can call it on every state change without touching the
+/// session thread's internals, and it's independently unit-testable
+/// against `reconcile.rs`'s existing `ActualLink` fixtures.
+///
+/// `describe` resolves a linked device's `DeviceId` to its current
+/// human-readable description for the panel — callers pass a lookup
+/// against the same `DeviceInfo` map the session already tracks, since
+/// this function has no PipeWire connection of its own.
+///
+/// **`ActualLink::Unknown` maps to `SilentNoDevice`, not `Linked`.** R5
+/// forbids ever claiming audio flows to a *known* device without
+/// verification — an `Unknown` link (WirePlumber interference, A1) is
+/// exactly the case where that verification fails, even though something
+/// technically feeds the capture side. `reconcile_now` corrects an
+/// `Unknown` link within one debounced tick regardless, so this is a
+/// momentary conservative default, not a state health ever sits in for
+/// user-observable spans.
+pub fn compute_health(
+    capture_node_present: bool,
+    actual: &crate::reconcile::ActualLink,
+    describe: impl Fn(&DeviceId) -> Option<String>,
+) -> HealthStatus {
+    if !capture_node_present {
+        return HealthStatus::Broken {
+            reason: "permanent source not present".to_string(),
+        };
+    }
+    match actual {
+        crate::reconcile::ActualLink::ToDevice(id) => match describe(id) {
+            Some(description) => HealthStatus::Linked {
+                device: id.clone(),
+                description,
+            },
+            // The reconciler resolved a link to this device identity, but
+            // the device already departed between that resolution and this
+            // health computation (a real, if narrow, race) — honest
+            // reporting says "no device," not a description we can't back.
+            None => HealthStatus::SilentNoDevice,
+        },
+        crate::reconcile::ActualLink::None => HealthStatus::SilentNoDevice,
+        crate::reconcile::ActualLink::Unknown => HealthStatus::SilentNoDevice,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +161,66 @@ mod tests {
             "bluez_input.AA:BB:CC:DD:EE:FF",
             "antibising_mic"
         ));
+    }
+
+    #[test]
+    fn compute_health_no_capture_node_is_broken() {
+        let health = compute_health(false, &crate::reconcile::ActualLink::None, |_| None);
+        assert!(matches!(health, HealthStatus::Broken { .. }));
+    }
+
+    #[test]
+    fn compute_health_no_link_is_silent_no_device() {
+        let health = compute_health(true, &crate::reconcile::ActualLink::None, |_| None);
+        assert_eq!(health, HealthStatus::SilentNoDevice);
+    }
+
+    #[test]
+    fn compute_health_linked_device_resolves_description() {
+        let id = DeviceId("dev-a".to_string());
+        let health = compute_health(
+            true,
+            &crate::reconcile::ActualLink::ToDevice(id.clone()),
+            |lookup_id| {
+                if *lookup_id == id {
+                    Some("Razer Seiren Mini".to_string())
+                } else {
+                    None
+                }
+            },
+        );
+        assert_eq!(
+            health,
+            HealthStatus::Linked {
+                device: id,
+                description: "Razer Seiren Mini".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn compute_health_linked_device_that_vanished_is_silent_not_a_stale_claim() {
+        // R5: never claim a device is feeding the source without being
+        // able to back it with a current description -- a departed device
+        // between link-resolution and health-computation must not surface
+        // as Linked with stale info.
+        let id = DeviceId("dev-gone".to_string());
+        let health = compute_health(
+            true,
+            &crate::reconcile::ActualLink::ToDevice(id),
+            |_| None,
+        );
+        assert_eq!(health, HealthStatus::SilentNoDevice);
+    }
+
+    #[test]
+    fn compute_health_unknown_link_is_silent_not_linked() {
+        // R5: an unidentifiable link (WirePlumber interference, A1) must
+        // never be reported as Linked -- that would be an unverified
+        // claim. It's SilentNoDevice, not Broken, since the reconciler
+        // will correct it on its next tick; this is a transient, not a
+        // failure state.
+        let health = compute_health(true, &crate::reconcile::ActualLink::Unknown, |_| None);
+        assert_eq!(health, HealthStatus::SilentNoDevice);
     }
 }
