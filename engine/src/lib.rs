@@ -5,11 +5,16 @@
 pub mod fragment;
 pub mod install;
 pub mod model;
+pub mod params;
 pub mod reconcile;
 pub mod routing;
 pub mod session;
 
-pub use fragment::{render as render_fragment, write_atomic, FragmentConfig, SOURCE_NAME};
+pub use fragment::{
+    guard_denoise_config, render as render_fragment, write_atomic, FragmentConfig, SOURCE_NAME,
+    DEFAULT_LADSPA_PLUGIN_PATH,
+};
 pub use install::{classify_startup, install, is_unit_active, uninstall, InstallPaths, StartupAction};
 pub use model::{DeviceId, DeviceInfo, HealthStatus};
+pub use params::{build_props_pod, RnnoiseParam};
 pub use session::{Session, SessionCommand, SessionEvent};

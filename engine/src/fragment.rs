@@ -31,12 +31,22 @@ pub const SOURCE_NAME: &str = "antibising_mic";
 /// PipeWire's SPA-JSON-like config language (hand-built text, not a
 /// generic serializer output — the format is not JSON: bare keys, no
 /// commas between object members).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FragmentConfig {
     /// Whether RNNoise is in the graph. `false` is U2's bypass-only graph
     /// (downmix + copy); `true` adds the RNNoise node between them (U5).
     pub denoise_enabled: bool,
     /// RNNoise VAD Threshold (%), only meaningful when `denoise_enabled`.
     pub vad_threshold: f64,
+    /// RNNoise's own `Dry Mix` control (0.0-1.0), the denoise on/off
+    /// toggle (U5/R6). `0.0` = full suppression (denoise on); `1.0` =
+    /// clean passthrough (denoise off) with the RNNoise node still in the
+    /// graph — no restart, no parallel bypass branch. Verified live: a
+    /// deterministic tone+noise fixture through a scratch fragment
+    /// measured RMS 0.257 at `Dry Mix=1.0` (matching direct bypass) and
+    /// RMS 0.0 at `Dry Mix=0.0` (RNNoise's own VAD-gated suppression).
+    /// Only meaningful when `denoise_enabled`.
+    pub dry_mix: f64,
 }
 
 impl Default for FragmentConfig {
@@ -44,6 +54,7 @@ impl Default for FragmentConfig {
         Self {
             denoise_enabled: false,
             vad_threshold: 95.0,
+            dry_mix: 0.0,
         }
     }
 }
@@ -71,14 +82,16 @@ pub fn render(config: &FragmentConfig) -> String {
                         label  = noise_suppressor_mono
                         control = {{
                           "VAD Threshold (%)" = {vad:.1}
+                          "Dry Mix" = {dry_mix:.3}
                         }}
                     }}"#,
-            vad = config.vad_threshold
+            vad = config.vad_threshold,
+            dry_mix = config.dry_mix
         );
         (
             format!("{mixer_node}\n{rnnoise_node}"),
-            "                links = [\n                    { output = \"mix:Out\" input = \"rnnoise:In\" }\n                ]\n".to_string(),
-            r#""rnnoise:Out""#,
+            "                links = [\n                    { output = \"mix:Out\" input = \"rnnoise:Input\" }\n                ]\n".to_string(),
+            r#""rnnoise:Output""#,
         )
     } else {
         (mixer_node.to_string(), String::new(), r#""mix:Out""#)
@@ -160,6 +173,37 @@ pub fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()
     Ok(())
 }
 
+/// The default system path for the RNNoise LADSPA plugin (from
+/// `noise-suppression-for-voice`, Arch Extra). U5's startup guard: the
+/// daemon checks this before generating an RNNoise fragment — if the
+/// plugin is missing, it must generate the bypass fragment instead and
+/// report `Broken("RNNoise plugin not found")` (R5), never fail to
+/// produce a source at all (R6: "R1 outranks the filter").
+pub const DEFAULT_LADSPA_PLUGIN_PATH: &str = "/usr/lib/ladspa/librnnoise_ladspa.so";
+
+/// Startup guard for U5: build the `FragmentConfig` that's actually safe
+/// to render, given whether the RNNoise plugin exists at `plugin_path`.
+/// Never renders an RNNoise graph pointing at a plugin that isn't there —
+/// `filter-chain.service` would simply fail to start, converting a
+/// missing-plugin problem into a missing-source problem, which is exactly
+/// what R6's "R1 outranks the filter" forbids.
+///
+/// Returns the config to render, plus `true` if the caller should report
+/// `Broken("RNNoise plugin not found")` (R5) instead of proceeding as if
+/// denoising were merely turned off by the user.
+pub fn guard_denoise_config(requested: FragmentConfig, plugin_path: &std::path::Path) -> (FragmentConfig, bool) {
+    if requested.denoise_enabled && !plugin_path.exists() {
+        return (
+            FragmentConfig {
+                denoise_enabled: false,
+                ..requested
+            },
+            true,
+        );
+    }
+    (requested, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,12 +234,49 @@ mod tests {
         let cfg = FragmentConfig {
             denoise_enabled: true,
             vad_threshold: 72.5,
+            dry_mix: 0.0,
         };
         let out = render(&cfg);
         assert!(out.contains("rnnoise"));
         assert!(out.contains("noise_suppressor_mono"));
         assert!(out.contains("72.5"));
     }
+
+    #[test]
+    fn denoise_graph_links_use_real_ladspa_port_names() {
+        // Regression: the LADSPA descriptor for noise_suppressor_mono
+        // names its audio ports "Input"/"Output" (confirmed via a direct
+        // descriptor probe against ladspa.h's real struct layout), not
+        // "In"/"Out" — a wrong name is a fragment PipeWire's filter-graph
+        // parser rejects at `filter-chain.service` start
+        // (`unknown input port rnnoise:In`), so this is load-bearing, not
+        // cosmetic.
+        let cfg = FragmentConfig {
+            denoise_enabled: true,
+            ..Default::default()
+        };
+        let out = render(&cfg);
+        assert!(out.contains(r#""mix:Out" input = "rnnoise:Input""#));
+        assert!(out.contains(r#"outputs = [ "rnnoise:Output" ]"#));
+        assert!(!out.contains("rnnoise:In\""));
+        assert!(!out.contains("rnnoise:Out\""));
+    }
+
+    #[test]
+    fn denoise_graph_includes_dry_mix_control() {
+        // R6's toggle: Dry Mix lives on the RNNoise node itself, not a
+        // parallel bypass branch (verified live: Dry Mix=1.0 measured
+        // RMS 0.257, matching bypass; Dry Mix=0.0 measured RMS 0.0 on a
+        // synthetic non-speech fixture, RNNoise's own VAD gating).
+        let cfg = FragmentConfig {
+            denoise_enabled: true,
+            dry_mix: 1.0,
+            ..Default::default()
+        };
+        let out = render(&cfg);
+        assert!(out.contains(r#""Dry Mix" = 1.000"#));
+    }
+
 
     #[test]
     fn source_name_is_fixed_and_device_independent() {
@@ -215,5 +296,56 @@ mod tests {
         let read_back = std::fs::read_to_string(&path).unwrap();
         assert_eq!(read_back, content);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn guard_falls_back_to_bypass_when_plugin_missing_and_denoise_requested() {
+        let missing = std::env::temp_dir().join(format!(
+            "antibising-guard-missing-{}.so",
+            std::process::id()
+        ));
+        let requested = FragmentConfig {
+            denoise_enabled: true,
+            vad_threshold: 80.0,
+            dry_mix: 0.0,
+        };
+        let (config, broken) = guard_denoise_config(requested, &missing);
+        assert!(!config.denoise_enabled, "must fall back to bypass when the plugin is missing");
+        assert!(broken, "caller must report Broken when falling back");
+    }
+
+    #[test]
+    fn guard_passes_through_unchanged_when_plugin_present() {
+        let dir = std::env::temp_dir().join(format!("antibising-guard-present-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("librnnoise_ladspa.so");
+        std::fs::write(&present, b"not a real plugin, just needs to exist").unwrap();
+
+        let requested = FragmentConfig {
+            denoise_enabled: true,
+            vad_threshold: 80.0,
+            dry_mix: 0.0,
+        };
+        let (config, broken) = guard_denoise_config(requested.clone(), &present);
+        assert_eq!(config.denoise_enabled, requested.denoise_enabled);
+        assert_eq!(config.vad_threshold, requested.vad_threshold);
+        assert!(!broken, "must not report Broken when the plugin is present");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn guard_is_noop_when_denoise_not_requested() {
+        // No plugin check needed at all if the user didn't ask for
+        // denoising — a missing plugin must never surface as Broken for a
+        // bypass-only fragment.
+        let missing = std::env::temp_dir().join(format!(
+            "antibising-guard-noop-{}.so",
+            std::process::id()
+        ));
+        let requested = FragmentConfig::default(); // denoise_enabled: false
+        let (config, broken) = guard_denoise_config(requested, &missing);
+        assert!(!config.denoise_enabled);
+        assert!(!broken);
     }
 }

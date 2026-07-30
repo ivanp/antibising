@@ -19,6 +19,7 @@ use pipewire::{
     core::CoreRc,
     link::Link,
     main_loop::MainLoopRc,
+    node::Node,
     properties::properties,
     registry::{GlobalObject, RegistryRc},
     spa::utils::dict::DictRef,
@@ -39,6 +40,11 @@ pub enum SessionCommand {
     /// Pin a specific device, suppressing ranking until unpinned or the
     /// device disappears (R3). `None` clears the pin.
     SetPin(Option<DeviceId>),
+    /// Set an RNNoise control live (U5/R8). A no-op, silently, if the
+    /// capture node isn't bound yet (no RNNoise fragment active) — the
+    /// caller's config write to the fragment is the durable half; this
+    /// is only the immediate-effect half (R2/Q8: never a restart).
+    SetRnnoiseParam(crate::params::RnnoiseParam, f32),
     /// Ask for a full re-emit of the current device set (used on IPC client
     /// connect for the initial snapshot).
     RequestSnapshot,
@@ -138,6 +144,15 @@ struct Generation {
     /// Our own capture node's input ports: (port global id, port name),
     /// and the capture node's own id.
     capture_node_id: Option<u32>,
+    /// A bound `Node` proxy for the capture node, used for U5's live
+    /// `set-param` calls (`Node::set_param`, per KTD2's native-crate
+    /// decision). Bound once the capture Node global arrives; cleared on
+    /// departure/reconnect along with `capture_node_id`. Kept separate
+    /// from `capture_node_id` (a plain `u32`) because a bound proxy is
+    /// `!Send`/non-`Clone`-cheap PipeWire state — only session.rs's own
+    /// thread ever touches it, exactly where KTD2 requires `!Send`
+    /// PipeWire objects to live.
+    capture_node_proxy: Option<Node>,
     capture_input_ports: Vec<(u32, String)>,
     /// Every Link global whose `link.input.node` is our capture node,
     /// keyed by the link's own global id. This is **observed graph
@@ -175,6 +190,7 @@ impl Generation {
             pending_nodes: HashMap::new(),
             device_output_ports: HashMap::new(),
             capture_node_id: None,
+            capture_node_proxy: None,
             capture_input_ports: Vec::new(),
             capture_links: HashMap::new(),
             preference_order: Vec::new(),
@@ -247,6 +263,7 @@ impl Generation {
         self.device_output_ports.remove(&node_id);
         if self.capture_node_id == Some(node_id) {
             self.capture_node_id = None;
+            self.capture_node_proxy = None;
             self.capture_input_ports.clear();
             self.capture_links.clear();
         }
@@ -308,6 +325,20 @@ impl Generation {
         match self.devices.get(&node_id) {
             Some(info) => ActualLink::ToDevice(info.id.clone()),
             None => ActualLink::Unknown,
+        }
+    }
+
+    /// Apply a live RNNoise control change (U5/R8), if the capture node's
+    /// proxy is currently bound. Silent no-op otherwise — no RNNoise
+    /// fragment active yet (bypass graph), or the bind hasn't landed —
+    /// matching the plan's rule that immediate effect is best-effort and
+    /// the fragment write is the durable half.
+    fn set_rnnoise_param(&self, param: crate::params::RnnoiseParam, value: f32) {
+        if let Some(node) = &self.capture_node_proxy {
+            let bytes = crate::params::build_props_pod(param, value);
+            if let Some(pod) = pipewire::spa::pod::Pod::from_bytes(&bytes) {
+                node.set_param(pipewire::spa::param::ParamType::Props, 0, pod);
+            }
         }
     }
 }
@@ -588,6 +619,7 @@ fn run_one_generation(
     let link_factory_for_global: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let link_factory_for_global2 = link_factory_for_global.clone();
     let dirty_for_remove = Rc::new(Cell::new(false));
+    let registry_for_global = registry.clone();
 
     let dirty_for_global = Rc::new(Cell::new(false));
     let dirty_for_global2 = dirty_for_global.clone();
@@ -600,6 +632,7 @@ fn run_one_generation(
                 &gen_for_global,
                 &tx_for_global,
                 &link_factory_for_global2,
+                &registry_for_global,
             );
             // Debounced reconciliation (see the dirty-flag timer below):
             // a single device/profile change fires a *burst* of Registry
@@ -700,6 +733,9 @@ fn run_one_generation(
                     gen.pin = pin;
                     reconcile_now(&mut gen, &core_for_timer, &link_factory_for_timer);
                 }
+                Ok(SessionCommand::SetRnnoiseParam(param, value)) => {
+                    gen_for_timer.borrow().set_rnnoise_param(param, value);
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // Sender (Session handle) dropped without an explicit
@@ -760,6 +796,7 @@ fn handle_global(
     generation: &Rc<RefCell<Generation>>,
     event_tx: &StdSender<SessionEvent>,
     link_factory: &Rc<RefCell<Option<String>>>,
+    registry: &RegistryRc,
 ) {
     let props = match global.props {
         Some(p) => p,
@@ -784,7 +821,15 @@ fn handle_global(
             let node_name = props.get("node.name").unwrap_or_default();
             let capture_name = format!("{our_source_name}_capture");
             if node_name == capture_name {
-                generation.borrow_mut().capture_node_id = Some(global.id);
+                let mut gen = generation.borrow_mut();
+                gen.capture_node_id = Some(global.id);
+                // Bind a Node proxy for U5's live set-param calls. Binding
+                // is best-effort: a bind failure (WrongProxyType, unlikely
+                // for a Node global) leaves capture_node_proxy None, and
+                // set_rnnoise_param below already treats that as a silent
+                // no-op — the durable half (fragment write) still applies
+                // on the next daemon start.
+                gen.capture_node_proxy = registry.bind::<Node, _>(global).ok();
                 return;
             }
 
