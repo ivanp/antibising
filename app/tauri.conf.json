@@ -12,7 +12,9 @@
         "title": "antibising",
         "width": 360,
         "height": 420,
-        "resizable": false,
+        "minWidth": 280,
+        "minHeight": 300,
+        "resizable": true,
         "fullscreen": false,
         "visible": true
       }
