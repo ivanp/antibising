@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-stop-meter"
+description = "Enables the stop_meter command without any pre-configured scope."
+commands.allow = ["stop_meter"]
+
+[[permission]]
+identifier = "deny-stop-meter"
+description = "Denies the stop_meter command without any pre-configured scope."
+commands.deny = ["stop_meter"]

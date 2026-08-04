@@ -1,0 +1,20 @@
+{
+  "identifier": "default",
+  "description": "Default capability for the antibising panel window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "allow-request-snapshot",
+    "allow-set-pin",
+    "allow-set-preference-order",
+    "allow-set-threshold",
+    "allow-toggle-denoise",
+    "allow-start-monitor",
+    "allow-stop-monitor",
+    "allow-start-meter",
+    "allow-stop-meter",
+    "allow-connection-state",
+    "allow-pull-state"
+  ]
+}

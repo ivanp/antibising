@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pull-state"
+description = "Enables the pull_state command without any pre-configured scope."
+commands.allow = ["pull_state"]
+
+[[permission]]
+identifier = "deny-pull-state"
+description = "Denies the pull_state command without any pre-configured scope."
+commands.deny = ["pull_state"]

@@ -1049,3 +1049,272 @@ fn dropin_guard_restores_content_on_explicit_restore_and_on_panic() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// RAII guard: `systemctl --user mask <unit>` on construction, unmask on
+/// drop (including on panic-unwind) — makes `filter-chain.service`
+/// unstartable by *any* means (not merely "currently failing"), which is
+/// what proves the daemon's regenerate-then-retry-once repair genuinely
+/// gives up rather than looping. Best-effort unmask in `Drop` (never
+/// panics there, matching `DropinGuard`'s own rule) so a panic mid-test
+/// never leaves the user's real `filter-chain.service` permanently
+/// masked.
+struct MaskGuard {
+    unit: &'static str,
+}
+
+impl MaskGuard {
+    fn new(unit: &'static str) -> Self {
+        run("systemctl", &["--user", "mask", unit]);
+        Self { unit }
+    }
+}
+
+impl Drop for MaskGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("systemctl")
+            .args(["--user", "unmask", self.unit])
+            .status();
+        let _ = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+    }
+}
+
+/// Connects to the daemon's own production IPC socket (never a scratch
+/// `IpcPaths::at`) — the point of this test is what the real
+/// `antibisingd run` invocation reports over its real socket, not a
+/// simulated `SharedState`. Retries briefly since the daemon's
+/// `bind_singleton` call happens after `reconcile_startup` returns, so
+/// the socket may not exist yet the instant the child process is
+/// spawned.
+fn connect_production_ipc(timeout: Duration) -> std::os::unix::net::UnixStream {
+    let base = std::env::var("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    let socket_path = base.join("antibising").join("antibisingd.sock");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match std::os::unix::net::UnixStream::connect(&socket_path) {
+            Ok(s) => return s,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!(
+                "failed to connect to production IPC socket {}: {e}",
+                socket_path.display()
+            ),
+        }
+    }
+}
+
+/// Reads the first `Hello` + `Snapshot` pair off a freshly-connected IPC
+/// stream and returns the `Snapshot`'s raw `health` JSON value — parsed
+/// generically (not via `antibisingd::ipc::Event`) since `engine`'s test
+/// binaries don't depend on the `antibisingd` crate. `Event`/`Request`
+/// use `#[serde(tag = "type", rename_all = "snake_case")]`, so the
+/// envelope's own `type` field is `"hello"`/`"snapshot"` — but the
+/// `health` value nested inside is a plain `engine::HealthStatus`, which
+/// has neither attribute and so serializes with serde's **default**
+/// externally-tagged shape and unrenamed (PascalCase) variant names:
+/// `"SilentNoDevice"`, `{"Broken": {"reason": "..."}}`, `{"Linked": {...}}`,
+/// `"Reconnecting"`. Callers must match on the *variant name itself* as
+/// a key (`health["Broken"]`), not a `"type"` field.
+fn read_snapshot_health(stream: std::os::unix::net::UnixStream) -> serde_json::Value {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read Hello line");
+    let hello: serde_json::Value =
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("parse Hello line {line:?}: {e}"));
+    assert_eq!(hello["type"], "hello", "expected Hello first, got {hello:?}");
+
+    line.clear();
+    reader.read_line(&mut line).expect("read Snapshot line");
+    let snapshot: serde_json::Value = serde_json::from_str(&line)
+        .unwrap_or_else(|e| panic!("parse Snapshot line {line:?}: {e}"));
+    assert_eq!(snapshot["type"], "snapshot", "expected Snapshot second, got {snapshot:?}");
+    snapshot["health"].clone()
+}
+
+/// **U9 test scenario:** "Corrupt fragment (write garbage into it, stop
+/// unit) → daemon start regenerates from config, unit starts, health
+/// `Linked`; a fragment that fails even after regeneration lands in
+/// `Broken` with the journal error, no start-loop." This test covers the
+/// second half — regeneration alone cannot fix things when
+/// `filter-chain.service` itself is unstartable (simulated here via
+/// `systemctl --user mask`, which fails *any* start/restart attempt
+/// regardless of fragment content — the deterministic way to force the
+/// "still fails after the one retry" branch without depending on a
+/// specific parse error surviving PipeWire version changes).
+///
+/// Exercised through the real `antibisingd run` subcommand end-to-end:
+/// spawn it, connect to its **real production IPC socket**, and read the
+/// `Snapshot.health` the very first client receives — proving both that
+/// `reconcile_startup`'s failure reaches `SharedState` before
+/// `accept_loop` starts serving (the U9 wiring in `cmd_run`) and that it
+/// carries the journal tail (R7: "say precisely what is wrong"), not
+/// just a bare failure flag.
+#[test]
+#[ignore = "live systemd/PipeWire test — real, persistent system changes; run with --ignored, with the user present and consenting"]
+fn corrupt_fragment_retry_still_fails_yields_broken_with_journal_error() {
+    let paths = production_paths();
+    assert_no_preexisting_install(&paths);
+    let _ = uninstall(&paths);
+    let _rig = InstallTestRig;
+
+    // Write the fragment directly (bypassing `install()`, which would
+    // also enable+start the real filter-chain.service) so this test
+    // never needs a working install first -- `reconcile_startup`'s cold
+    // start (`StartFilterChain`) is the branch under test here: unit
+    // inactive, no source, fragment present but the unit itself
+    // unstartable.
+    std::fs::create_dir_all(
+        paths
+            .fragment_path
+            .parent()
+            .expect("fragment_path must have a parent"),
+    )
+    .expect("create conf.d directory");
+    std::fs::write(&paths.fragment_path, "garbage, not a valid filter-chain fragment\n")
+        .expect("write corrupt fragment");
+    assert!(
+        !is_unit_active(FILTER_CHAIN_UNIT),
+        "filter-chain.service must be inactive before this test's cold-start path runs"
+    );
+
+    // Mask filter-chain.service: every `systemctl start`/`restart`
+    // against it now fails deterministically, regardless of what
+    // `reconcile_startup` regenerates the fragment into. This is what
+    // proves the daemon's one-retry repair genuinely gives up rather
+    // than looping -- a real parse-error fragment would (correctly) be
+    // fixed by regeneration, which would make this scenario untestable
+    // without masking.
+    let _mask_guard = MaskGuard::new(FILTER_CHAIN_UNIT);
+
+    let mut child = ChildGuard(
+        std::process::Command::new(&paths.daemon_exec_path)
+            .arg("run")
+            .spawn()
+            .expect("spawn `antibisingd run`"),
+    );
+
+    let health = read_snapshot_health(connect_production_ipc(Duration::from_secs(5)));
+
+    if !child.terminate_and_wait("-TERM", Duration::from_secs(5)) {
+        assert!(
+            child.terminate_and_wait("-KILL", Duration::from_secs(5)),
+            "antibisingd run did not exit even after SIGKILL"
+        );
+    }
+
+    assert!(
+        health["Broken"].is_object(),
+        "expected Broken health after a masked (permanently unstartable) filter-chain.service, \
+         got: {health:?}"
+    );
+    let reason = health["Broken"]["reason"]
+        .as_str()
+        .expect("Broken health must carry a string reason");
+    assert!(
+        reason.contains("journal") || reason.to_lowercase().contains("masked") || reason.contains("systemctl"),
+        "Broken reason should be precise enough to act on (R7) -- expected it to mention the \
+         journal tail, the unit being masked, or the systemctl failure; got: {reason}"
+    );
+    assert!(
+        !exact_source_present(SOURCE_NAME),
+        "source must not exist -- filter-chain.service never started"
+    );
+}
+
+/// **U9 test scenario:** "Kill daemon (SIGKILL) while a consumer holds
+/// the source → consumer unaffected; systemd restarts daemon; routing
+/// resumes ≤ 5 s." Full lifecycle through the real bootstrap: install,
+/// confirm the consumer survives systemd killing and restarting the
+/// *daemon* process (not PipeWire, not filter-chain.service -- neither
+/// of which this signal touches), and that a fresh IPC client connected
+/// after the restart observes routing again reporting `Linked` rather
+/// than a stale or missing verdict.
+#[test]
+#[ignore = "live systemd/PipeWire test — real, persistent system changes; run with --ignored, with the user present and consenting"]
+fn daemon_sigkill_with_consumer_attached_consumer_unaffected_routing_resumes() {
+    let paths = production_paths();
+    assert_no_preexisting_install(&paths);
+    let _ = uninstall(&paths);
+    let _rig = InstallTestRig;
+
+    install(&paths).expect("install should succeed");
+    assert!(source_present(Duration::from_secs(5)));
+    assert!(is_unit_active(DAEMON_UNIT), "daemon should be active after install");
+
+    // Attach a real consumer to the permanent source -- the R2 claim
+    // this test exists to check is specifically about *this*, not about
+    // the source node merely existing.
+    let mut consumer = Command::new("pw-record")
+        .args(["--target", SOURCE_NAME, "/dev/null"])
+        .spawn()
+        .expect("spawn pw-record consumer");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        consumer.try_wait().expect("check consumer status").is_none(),
+        "consumer should be running before the SIGKILL"
+    );
+
+    let daemon_pid_before =
+        systemd_main_pid(DAEMON_UNIT).expect("read daemon MainPID before SIGKILL");
+
+    run("systemctl", &["--user", "kill", "--signal=SIGKILL", DAEMON_UNIT]);
+
+    // The consumer must never notice: nothing here signals PipeWire or
+    // filter-chain.service, only the antibisingd process itself. Poll
+    // across the whole window (SIGKILL delivery, systemd's
+    // Restart=on-failure relaunch, and the new daemon's reconcile) --
+    // a mid-window death would be masked by only checking at the end.
+    let restart_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut daemon_restarted = false;
+    while std::time::Instant::now() < restart_deadline {
+        assert!(
+            consumer.try_wait().expect("check consumer status").is_none(),
+            "consumer process exited while the daemon was being killed/restarted -- capture \
+             was interrupted, which SIGKILLing only antibisingd.service must never cause"
+        );
+        if let Some(pid_after) = systemd_main_pid(DAEMON_UNIT) {
+            if pid_after != daemon_pid_before {
+                daemon_restarted = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        daemon_restarted,
+        "{DAEMON_UNIT} should get a fresh MainPID within 5s of being SIGKILLed \
+         (Restart=on-failure)"
+    );
+
+    // Final consumer check past the restart -- the loop above only
+    // proves it survived up to the moment the new PID appeared; confirm
+    // it is still alive after that too.
+    assert!(
+        consumer.try_wait().expect("check consumer status").is_none(),
+        "consumer process must still be running after the daemon's restart"
+    );
+
+    // Routing resumes: a fresh IPC client connected to the *new* daemon
+    // process must see health reconverge to Linked, not stay on
+    // whatever the old process last reported (the connection dropped
+    // when the old process was killed, so this is a genuinely new
+    // connection to the new process, not a leftover stream).
+    let relinked = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        let health = read_snapshot_health(connect_production_ipc(Duration::from_secs(2)));
+        health["Linked"].is_object()
+    });
+    assert!(
+        relinked,
+        "expected health to reconverge to Linked within 5s of the daemon's restart -- routing \
+         must resume, not just the process existing"
+    );
+
+    let _ = consumer.kill();
+    let _ = consumer.wait();
+}

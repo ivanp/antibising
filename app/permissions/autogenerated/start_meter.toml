@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-meter"
+description = "Enables the start_meter command without any pre-configured scope."
+commands.allow = ["start_meter"]
+
+[[permission]]
+identifier = "deny-start-meter"
+description = "Denies the start_meter command without any pre-configured scope."
+commands.deny = ["start_meter"]

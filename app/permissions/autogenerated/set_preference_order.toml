@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-preference-order"
+description = "Enables the set_preference_order command without any pre-configured scope."
+commands.allow = ["set_preference_order"]
+
+[[permission]]
+identifier = "deny-set-preference-order"
+description = "Denies the set_preference_order command without any pre-configured scope."
+commands.deny = ["set_preference_order"]

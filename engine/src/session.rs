@@ -19,16 +19,23 @@ use pipewire::{
     core::CoreRc,
     link::Link,
     main_loop::MainLoopRc,
-    node::Node,
+    metadata::Metadata,
     properties::properties,
+    node::Node,
     registry::{GlobalObject, RegistryRc},
-    spa::utils::dict::DictRef,
+    spa::{
+        param::audio::AudioInfoRaw,
+        pod::Pod,
+        utils::{dict::DictRef, Direction},
+    },
+    stream::{StreamFlags, StreamListener, StreamRc},
     types::ObjectType,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver as StdReceiver, Sender as StdSender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -49,6 +56,29 @@ pub enum SessionCommand {
     /// Ask for a full re-emit of the current device set (used on IPC client
     /// connect for the initial snapshot).
     RequestSnapshot,
+    /// Start hear-yourself monitoring (U6/R9) for the client identified by
+    /// `session_id` (assigned by the IPC layer, unique per connection).
+    /// Links the permanent source's own output ports to the current
+    /// default sink's input ports. `session_id` scopes the resulting
+    /// links so `StopMonitor` (explicit, or the IPC layer's own
+    /// connection-drop cleanup) tears down exactly this client's links,
+    /// never another's.
+    StartMonitor(u64),
+    /// Stop monitoring for `session_id` — destroys exactly the links
+    /// `StartMonitor(session_id)` created. Idempotent: stopping a
+    /// session that was never started, or already stopped, is a no-op.
+    StopMonitor(u64),
+    /// Start the level meter (U6/R9) for `session_id`, pushing
+    /// [`crate::meter::MeterFrame`]s into the given bounded, drop-oldest
+    /// channel as an engine-side capture stream on the permanent source
+    /// produces them. The channel crosses the thread boundary via
+    /// `Arc<Mutex<_>>` rather than the `SessionEvent` mpsc channel
+    /// deliberately — frames must never queue unboundedly for a slow
+    /// IPC client, which an unbounded `mpsc::Sender` would allow.
+    StartMeter(u64, Arc<Mutex<crate::meter::MeterChannel>>),
+    /// Stop the meter for `session_id` — disconnects and drops the
+    /// capture stream. Idempotent.
+    StopMeter(u64),
     /// Clean shutdown: quit the loop and let the thread join.
     Shutdown,
 }
@@ -71,7 +101,23 @@ pub enum SessionEvent {
     /// forwards this verbatim to clients rather than re-deriving it, so
     /// it must never fire on every reconcile tick regardless of change.
     HealthChanged(crate::model::HealthStatus),
+    /// `StartMonitor(session_id)` succeeded — links exist. Carries the
+    /// R9 speaker-vs-headset assessment for the daemon to relay as an
+    /// inline warning (never a refusal).
+    MonitorStarted {
+        session_id: u64,
+        speaker_risk: crate::monitor::SpeakerRisk,
+    },
+    /// `StartMonitor(session_id)` could not proceed — e.g. no default
+    /// sink has been resolved yet. Distinct from `HealthStatus::Broken`:
+    /// this is a per-request failure, not the permanent source's own
+    /// health.
+    MonitorFailed { session_id: u64, reason: String },
+    /// `StopMonitor(session_id)` completed (or the session was already
+    /// stopped) — links gone.
+    MonitorStopped { session_id: u64 },
 }
+
 
 /// How often the pw loop polls for outside commands. Small enough that
 /// `RequestSnapshot`/`Shutdown` feel instant; large enough not to matter for
@@ -188,6 +234,44 @@ struct Generation {
     /// `HealthChanged` — U10's IPC clients need change events, not a
     /// flood on every debounced reconcile tick.
     last_health: Option<crate::model::HealthStatus>,
+    /// Our own permanent source's node id (playback side, `SOURCE_NAME`
+    /// — distinct from `capture_node_id`, the input side). Needed for
+    /// U6's monitor links (source output ports -> default sink input
+    /// ports).
+    source_node_id: Option<u32>,
+    /// The permanent source's own output ports: (port global id, port
+    /// name). U6's monitor links originate here.
+    source_output_ports: Vec<(u32, String)>,
+    /// Every `Audio/Sink` node currently visible, keyed by node id —
+    /// candidates for monitoring's destination. `device_id` is the
+    /// owning Device global's id (for `device.form_factor` resolution,
+    /// R9's speaker-warning heuristic), `None` if the sink has no owning
+    /// Device (unusual but not impossible).
+    sinks: HashMap<u32, SinkInfo>,
+    /// Each known sink's input ports: node id -> (port global id, port
+    /// name).
+    sink_input_ports: HashMap<u32, Vec<(u32, String)>>,
+    /// The default sink's `node.name`, resolved from the `default`
+    /// Metadata object's `default.audio.sink` key (Q6: monitoring routes
+    /// to whatever is default *at the moment it starts*, not tracked
+    /// live thereafter — this field is read once per `StartMonitor`,
+    /// never subscribed to for the lifetime of a monitor session).
+    default_sink_name: Option<String>,
+    /// Device global id -> `device.form_factor`, when the Device global
+    /// carries one (verified this session: present on headset/webcam
+    /// cards, absent on plain HDA sinks). Feeds R9's speaker-risk
+    /// heuristic via `SinkInfo::device_global_id`.
+    device_form_factors: HashMap<u32, String>,
+    /// Active monitor sessions, keyed by the IPC-assigned `session_id`.
+    /// Each holds the Link global ids it created, so `StopMonitor`
+    /// (explicit, or connection-drop cleanup) tears down exactly this
+    /// session's links and no other's.
+    monitor_sessions: HashMap<u64, MonitorSession>,
+    /// Active meter capture streams, keyed by `session_id`. The
+    /// `StreamRc`/`StreamListener` pair must outlive the stream's
+    /// registered `process` callback — dropping either tears the stream
+    /// down, which is exactly `StopMeter`'s mechanism.
+    meter_sessions: HashMap<u64, MeterSession>,
 }
 
 /// A Link global observed on the capture node, as reported by PipeWire —
@@ -205,6 +289,38 @@ struct PendingNode {
     description: String,
 }
 
+/// A known `Audio/Sink` node — a candidate monitor destination.
+struct SinkInfo {
+    node_name: String,
+    description: String,
+    /// The owning Device global's id, if resolvable (`device.id`
+    /// present) — used to look up `device.form_factor` for R9's
+    /// speaker-warning heuristic.
+    device_global_id: Option<u32>,
+}
+
+/// A live hear-yourself monitor session (U6/R9), bound to one IPC
+/// client's `session_id`. RAII in spirit but not in Rust's `Drop` sense —
+/// `StopMonitor` (explicit or connection-drop cleanup) is what tears
+/// down `link_ids`; a `Generation` reconnect (session.rs's own "recovery
+/// is a clean rebuild") also implicitly ends every session, since the
+/// links themselves die with the old PipeWire connection.
+struct MonitorSession {
+    #[allow(dead_code)] // kept alive for its Drop; never read directly
+    links: Vec<Link>,
+}
+
+/// A live meter capture session (U6/R9), bound to one IPC client's
+/// `session_id`. Holds the stream + its listener (whose `process`
+/// callback pushes frames into `channel`) so both stay alive exactly as
+/// long as the session does; dropping either tears the stream down.
+struct MeterSession {
+    #[allow(dead_code)] // kept alive for its Drop; never read directly
+    stream: StreamRc,
+    #[allow(dead_code)] // kept alive for its Drop; never read directly
+    listener: StreamListener<()>,
+}
+
 impl Generation {
     fn new() -> Self {
         Self {
@@ -219,6 +335,14 @@ impl Generation {
             preference_order: Vec::new(),
             pin: None,
             last_health: None,
+            source_node_id: None,
+            source_output_ports: Vec::new(),
+            sinks: HashMap::new(),
+            sink_input_ports: HashMap::new(),
+            default_sink_name: None,
+            device_form_factors: HashMap::new(),
+            monitor_sessions: HashMap::new(),
+            meter_sessions: HashMap::new(),
         }
     }
 
@@ -291,6 +415,13 @@ impl Generation {
             self.capture_input_ports.clear();
             self.capture_links.clear();
         }
+        if self.source_node_id == Some(node_id) {
+            self.source_node_id = None;
+            self.source_output_ports.clear();
+        }
+        if self.sinks.remove(&node_id).is_some() {
+            self.sink_input_ports.remove(&node_id);
+        }
         if let Some(dev) = self.devices.remove(&node_id) {
             let _ = event_tx.send(SessionEvent::DeviceDeparted(dev.id));
         }
@@ -298,9 +429,21 @@ impl Generation {
 
     fn device_departed(&mut self, device_global_id: u32) {
         self.device_identities.remove(&device_global_id);
+        self.device_form_factors.remove(&device_global_id);
         // Nodes belonging to this device depart via their own
         // global_remove events; nothing to do here beyond forgetting the
         // identity so a stale node can't resolve against it.
+    }
+
+    /// Record a Device global's `device.form_factor`, when present
+    /// (verified this session: present on headset/webcam cards, absent
+    /// on plain HDA sinks). Feeds R9's speaker-risk heuristic via
+    /// `SinkInfo::device_global_id`; a silent no-op if the Device global
+    /// carries no form-factor property.
+    fn set_device_form_factor(&mut self, device_global_id: u32, form_factor: Option<&str>) {
+        if let Some(ff) = form_factor {
+            self.device_form_factors.insert(device_global_id, ff.to_string());
+        }
     }
 
     /// Current present-device set, for the routing policy.
@@ -388,6 +531,32 @@ impl Generation {
             self.last_health = Some(health.clone());
             let _ = event_tx.send(SessionEvent::HealthChanged(health));
         }
+    }
+
+    /// Resolve the default sink's `node.name` at the current moment
+    /// (Q6: monitoring routes to whatever is default *when it starts*,
+    /// never tracked live thereafter). Reads the cached
+    /// `default_sink_name`, itself kept current by the Metadata
+    /// listener's `property` callback.
+    fn resolve_default_sink_node_id(&self) -> Option<u32> {
+        let name = self.default_sink_name.as_deref()?;
+        self.sinks
+            .iter()
+            .find(|(_, s)| s.node_name == name)
+            .map(|(id, _)| *id)
+    }
+
+    /// The R9 speaker-risk assessment for a given sink node id, using
+    /// whatever `device.form_factor` and name signals are available.
+    fn speaker_risk_for_sink(&self, sink_node_id: u32) -> crate::monitor::SpeakerRisk {
+        let Some(sink) = self.sinks.get(&sink_node_id) else {
+            return crate::monitor::SpeakerRisk::Unknown;
+        };
+        let form_factor = sink
+            .device_global_id
+            .and_then(|id| self.device_form_factors.get(&id))
+            .map(String::as_str);
+        crate::monitor::assess_speaker_risk(form_factor, &sink.description)
     }
 }
 
@@ -577,6 +746,76 @@ mod generation_tests {
         );
         assert_eq!(gen.actual_link(), ActualLink::Unknown);
     }
+
+    #[test]
+    fn speaker_risk_for_sink_uses_owning_devices_form_factor() {
+        let mut gen = Generation::new();
+        // Device global 58 owns sink node 200; form factor is set on the
+        // Device global (58), never the sink node itself, matching how
+        // handle_global wires ObjectType::Device -> set_device_form_factor.
+        gen.set_device_form_factor(58, Some("headset"));
+        gen.sinks.insert(
+            200,
+            SinkInfo {
+                node_name: "sink.headset".into(),
+                description: "Some Speaker-Named Thing".into(),
+                device_global_id: Some(58),
+            },
+        );
+        assert_eq!(
+            gen.speaker_risk_for_sink(200),
+            crate::monitor::SpeakerRisk::LikelyHeadphones,
+            "form factor must win over a misleading name"
+        );
+    }
+
+    #[test]
+    fn speaker_risk_for_sink_falls_back_to_name_when_no_form_factor_known() {
+        let mut gen = Generation::new();
+        gen.sinks.insert(
+            201,
+            SinkInfo {
+                node_name: "sink.hdmi".into(),
+                description: "HDMI Output".into(),
+                device_global_id: None,
+            },
+        );
+        assert_eq!(
+            gen.speaker_risk_for_sink(201),
+            crate::monitor::SpeakerRisk::LikelySpeaker
+        );
+    }
+
+    #[test]
+    fn speaker_risk_for_sink_unknown_for_unresolved_sink_node() {
+        let gen = Generation::new();
+        assert_eq!(
+            gen.speaker_risk_for_sink(999),
+            crate::monitor::SpeakerRisk::Unknown
+        );
+    }
+
+    #[test]
+    fn device_departed_clears_its_form_factor() {
+        let mut gen = Generation::new();
+        gen.set_device_form_factor(58, Some("headset"));
+        gen.sinks.insert(
+            200,
+            SinkInfo {
+                node_name: "sink.headset".into(),
+                description: "Ambiguous Name".into(),
+                device_global_id: Some(58),
+            },
+        );
+        gen.device_departed(58);
+        // With the form factor gone, resolution falls through to the
+        // name heuristic — which for this ambiguous description yields
+        // Unknown rather than resurrecting the stale headset verdict.
+        assert_eq!(
+            gen.speaker_risk_for_sink(200),
+            crate::monitor::SpeakerRisk::Unknown
+        );
+    }
 }
 
 enum GenerationOutcome {
@@ -668,6 +907,9 @@ fn run_one_generation(
     let link_factory_for_global2 = link_factory_for_global.clone();
     let dirty_for_remove = Rc::new(Cell::new(false));
     let registry_for_global = registry.clone();
+    let metadata_holder: Rc<RefCell<Option<(Metadata, pipewire::metadata::MetadataListener)>>> =
+        Rc::new(RefCell::new(None));
+    let metadata_holder_for_global = metadata_holder.clone();
 
     let dirty_for_global = Rc::new(Cell::new(false));
     let dirty_for_global2 = dirty_for_global.clone();
@@ -681,6 +923,7 @@ fn run_one_generation(
                 &tx_for_global,
                 &link_factory_for_global2,
                 &registry_for_global,
+                &metadata_holder_for_global,
             );
             // Debounced reconciliation (see the dirty-flag timer below):
             // a single device/profile change fires a *burst* of Registry
@@ -786,6 +1029,22 @@ fn run_one_generation(
                 Ok(SessionCommand::SetRnnoiseParam(param, value)) => {
                     gen_for_timer.borrow().set_rnnoise_param(param, value);
                 }
+                Ok(SessionCommand::StartMonitor(session_id)) => {
+                    let mut gen = gen_for_timer.borrow_mut();
+                    start_monitor(&mut gen, &core_for_timer, &link_factory_for_timer, session_id, &tx_for_timer);
+                }
+                Ok(SessionCommand::StopMonitor(session_id)) => {
+                    let mut gen = gen_for_timer.borrow_mut();
+                    stop_monitor(&mut gen, session_id);
+                    let _ = tx_for_timer.send(SessionEvent::MonitorStopped { session_id });
+                }
+                Ok(SessionCommand::StartMeter(session_id, channel)) => {
+                    let mut gen = gen_for_timer.borrow_mut();
+                    start_meter(&mut gen, &core_for_timer, session_id, channel);
+                }
+                Ok(SessionCommand::StopMeter(session_id)) => {
+                    gen_for_timer.borrow_mut().meter_sessions.remove(&session_id);
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // Sender (Session handle) dropped without an explicit
@@ -847,6 +1106,7 @@ fn handle_global(
     event_tx: &StdSender<SessionEvent>,
     link_factory: &Rc<RefCell<Option<String>>>,
     registry: &RegistryRc,
+    metadata_holder: &Rc<RefCell<Option<(Metadata, pipewire::metadata::MetadataListener)>>>,
 ) {
     let props = match global.props {
         Some(p) => p,
@@ -856,9 +1116,10 @@ fn handle_global(
     match global.type_ {
         ObjectType::Device => {
             let identity = resolve_device_identity(props);
-            generation
-                .borrow_mut()
-                .device_arrived(global.id, identity, event_tx);
+            let form_factor = props.get("device.form_factor");
+            let mut gen = generation.borrow_mut();
+            gen.set_device_form_factor(global.id, form_factor);
+            gen.device_arrived(global.id, identity, event_tx);
         }
         ObjectType::Factory => {
             if props.get("factory.type.name") == Some(ObjectType::Link.to_str()) {
@@ -882,8 +1143,32 @@ fn handle_global(
                 gen.capture_node_proxy = registry.bind::<Node, _>(global).ok();
                 return;
             }
+            if node_name == our_source_name {
+                // U6's monitor links originate from our own source's
+                // output ports; track its node id the same way the
+                // capture side is tracked above.
+                generation.borrow_mut().source_node_id = Some(global.id);
+                return;
+            }
 
             let media_class = props.get("media.class").unwrap_or_default();
+            if media_class == "Audio/Sink" {
+                let device_global_id = props.get("device.id").and_then(|s| s.parse().ok());
+                let description = props
+                    .get("node.description")
+                    .unwrap_or(node_name)
+                    .to_string();
+                generation.borrow_mut().sinks.insert(
+                    global.id,
+                    SinkInfo {
+                        node_name: node_name.to_string(),
+                        description,
+                        device_global_id,
+                    },
+                );
+                return;
+            }
+
             if !is_candidate_source(media_class, node_name, our_source_name) {
                 return;
             }
@@ -917,12 +1202,22 @@ fn handle_global(
 
             let mut gen = generation.borrow_mut();
             if direction == "out" {
+                if gen.source_node_id == Some(node_id) {
+                    gen.source_output_ports.push((global.id, port_name.clone()));
+                }
                 gen.device_output_ports
                     .entry(node_id)
                     .or_default()
                     .push((global.id, port_name));
-            } else if direction == "in" && gen.capture_node_id == Some(node_id) {
-                gen.capture_input_ports.push((global.id, port_name));
+            } else if direction == "in" {
+                if gen.capture_node_id == Some(node_id) {
+                    gen.capture_input_ports.push((global.id, port_name));
+                } else if gen.sinks.contains_key(&node_id) {
+                    gen.sink_input_ports
+                        .entry(node_id)
+                        .or_default()
+                        .push((global.id, port_name));
+                }
             }
         }
         ObjectType::Link => {
@@ -954,6 +1249,34 @@ fn handle_global(
                     input_port_id,
                 },
             );
+        }
+        ObjectType::Metadata => {
+            // Multiple Metadata objects can exist; only "default" carries
+            // default.audio.sink (verified this session: `pw-metadata -n
+            // default` is the exact source of `default.audio.sink`'s
+            // `{"name":"<node.name>"}` JSON value Q6's monitor
+            // destination resolves from).
+            if props.get("metadata.name") != Some("default") {
+                return;
+            }
+            if let Ok(metadata) = registry.bind::<Metadata, _>(global) {
+                let gen_for_meta = generation.clone();
+                let listener = metadata
+                    .add_listener_local()
+                    .property(move |_subject, key, _type, value| {
+                        if key == Some("default.audio.sink") {
+                            let resolved = value.and_then(|v| {
+                                serde_json::from_str::<serde_json::Value>(v)
+                                    .ok()
+                                    .and_then(|j| j.get("name")?.as_str().map(str::to_string))
+                            });
+                            gen_for_meta.borrow_mut().default_sink_name = resolved;
+                        }
+                        0
+                    })
+                    .register();
+                *metadata_holder.borrow_mut() = Some((metadata, listener));
+            }
         }
         _ => {}
     }
@@ -1150,4 +1473,210 @@ fn converge_capture_links(
             let _ = link;
         }
     }
+}
+
+/// Start hear-yourself monitoring for `session_id` (U6/R9): link the
+/// permanent source's own output ports to the current default sink's
+/// input ports. Q6: the default sink is resolved *once*, at this call —
+/// never tracked live thereafter (stopping and restarting monitoring
+/// re-resolves it, which is the plan's own documented behavior for
+/// something explicitly temporary).
+///
+/// Emits `MonitorStarted` (with the R9 speaker-risk assessment, never a
+/// refusal) on success, `MonitorFailed` if no source or no resolvable
+/// default sink exists yet.
+fn start_monitor(
+    gen: &mut Generation,
+    core: &CoreRc,
+    link_factory: &Rc<RefCell<Option<String>>>,
+    session_id: u64,
+    event_tx: &StdSender<SessionEvent>,
+) {
+    let Some(source_node_id) = gen.source_node_id else {
+        let _ = event_tx.send(SessionEvent::MonitorFailed {
+            session_id,
+            reason: "permanent source not present".to_string(),
+        });
+        return;
+    };
+    let Some(sink_node_id) = gen.resolve_default_sink_node_id() else {
+        let _ = event_tx.send(SessionEvent::MonitorFailed {
+            session_id,
+            reason: "no default sink resolved yet".to_string(),
+        });
+        return;
+    };
+    let Some(factory_name) = link_factory.borrow().clone() else {
+        let _ = event_tx.send(SessionEvent::MonitorFailed {
+            session_id,
+            reason: "link factory not discovered yet".to_string(),
+        });
+        return;
+    };
+
+    let source_ports = gen.source_output_ports.clone();
+    let mut sink_ports = gen
+        .sink_input_ports
+        .get(&sink_node_id)
+        .cloned()
+        .unwrap_or_default();
+    if source_ports.is_empty() || sink_ports.is_empty() {
+        let _ = event_tx.send(SessionEvent::MonitorFailed {
+            session_id,
+            reason: "source or sink has no ports yet".to_string(),
+        });
+        return;
+    }
+
+    // Pair positionally, same rule as converge_capture_links: real port
+    // names differ per sink/driver, sorted position is the robust match.
+    let mut source_ports = source_ports;
+    source_ports.sort_by(|a, b| a.1.cmp(&b.1));
+    sink_ports.sort_by(|a, b| a.1.cmp(&b.1));
+
+    // A positional 1:1 zip silently drops every sink port past the
+    // shorter side's length -- exactly what happens for this product's
+    // own permanent source, which is always mono ([ MONO ] per U2's
+    // fragment) monitored to an ordinary stereo sink: `zip` would link
+    // only the first channel (e.g. left) and leave the other silent,
+    // with no error and no visible sign anything is wrong. Fan the
+    // mono case out explicitly: every sink input port gets a link from
+    // the source's single output port, so a mono source is heard in
+    // both ears rather than going half-silent. A source with more than
+    // one output port (not a case this product's own source produces,
+    // but the function's own doc comment doesn't rule it out) keeps
+    // the prior positional pairing, truncated to the shorter side --
+    // unchanged behavior for that case.
+    let mut links = Vec::new();
+    if source_ports.len() == 1 {
+        let (out_port_id, _) = source_ports[0];
+        for (in_port_id, _) in &sink_ports {
+            let props = properties! {
+                "link.output.node" => source_node_id.to_string(),
+                "link.output.port" => out_port_id.to_string(),
+                "link.input.node" => sink_node_id.to_string(),
+                "link.input.port" => in_port_id.to_string(),
+                // Monitoring is explicitly temporary (R9) -- no
+                // object.linger here. A daemon crash must not leave a
+                // monitor link playing to speakers forever;
+                // StopMonitor is the only intended teardown path, and
+                // per KTD5's own contrast, a session that isn't meant
+                // to survive a crash is exactly the case linger is NOT
+                // used for. Without linger, dropping the proxy tears
+                // the link down server-side (confirmed in
+                // pipewire-rs's own `Proxy::drop` -> `pw_proxy_destroy`)
+                // -- so the proxy itself must be *kept*, in
+                // `MonitorSession`, until `StopMonitor`.
+            };
+            if let Ok(link) = core.create_object::<Link>(&factory_name, &props) {
+                links.push(link);
+            }
+        }
+    } else {
+        for ((out_port_id, _), (in_port_id, _)) in source_ports.iter().zip(sink_ports.iter()) {
+            let props = properties! {
+                "link.output.node" => source_node_id.to_string(),
+                "link.output.port" => out_port_id.to_string(),
+                "link.input.node" => sink_node_id.to_string(),
+                "link.input.port" => in_port_id.to_string(),
+            };
+            if let Ok(link) = core.create_object::<Link>(&factory_name, &props) {
+                links.push(link);
+            }
+        }
+    }
+
+    let speaker_risk = gen.speaker_risk_for_sink(sink_node_id);
+    gen.monitor_sessions.insert(session_id, MonitorSession { links });
+    let _ = event_tx.send(SessionEvent::MonitorStarted { session_id, speaker_risk });
+}
+
+/// Stop monitoring for `session_id` (explicit `StopMonitor`, or the IPC
+/// layer's connection-drop cleanup) — destroys exactly this session's
+/// links. Idempotent: a `session_id` that was never started, or already
+/// stopped, is a silent no-op. Dropping `MonitorSession` is the teardown
+/// mechanism itself: its `Link` proxies were created without
+/// `object.linger`, so dropping them tears the links down server-side.
+fn stop_monitor(gen: &mut Generation, session_id: u64) {
+    gen.monitor_sessions.remove(&session_id);
+}
+
+/// Start the U6/R9 level meter for `session_id`: an engine-side capture
+/// stream on the permanent source, pushing computed
+/// [`crate::meter::MeterFrame`]s into `channel` as buffers arrive. The
+/// stream captures F32LE mono audio (matching the source's own fixed
+/// `[ MONO ]` position, per U2) via `STREAM_CAPTURE_SINK`-free autoconnect
+/// targeting the source's own node name.
+fn start_meter(
+    gen: &mut Generation,
+    core: &CoreRc,
+    session_id: u64,
+    channel: Arc<Mutex<crate::meter::MeterChannel>>,
+) {
+    let Some(source_node_id) = gen.source_node_id else {
+        return; // No source yet; caller's channel simply never receives frames.
+    };
+
+    let props = properties! {
+        *pipewire::keys::MEDIA_TYPE => "Audio",
+        *pipewire::keys::MEDIA_CATEGORY => "Capture",
+        *pipewire::keys::MEDIA_ROLE => "Music",
+        "target.object" => source_node_id.to_string(),
+        *pipewire::keys::STREAM_DONT_REMIX => "true",
+    };
+    let Ok(stream) = StreamRc::new(core.clone(), "antibising-meter", props) else {
+        return;
+    };
+
+    let listener = stream
+        .add_local_listener::<()>()
+        .process(move |stream, _| {
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            let Some(data) = datas.first_mut() else {
+                return;
+            };
+            let Some(raw) = data.data() else {
+                return;
+            };
+            let samples: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let frame = crate::meter::compute_frame(&samples);
+            if let Ok(mut ch) = channel.lock() {
+                ch.push(frame);
+            }
+        })
+        .register()
+        .expect("registering the meter stream listener cannot fail for a valid stream");
+
+    let mut audio_info = AudioInfoRaw::new();
+    audio_info.set_format(pipewire::spa::param::audio::AudioFormat::F32LE);
+    audio_info.set_channels(1);
+    let obj = pipewire::spa::pod::Object {
+        type_: pipewire::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: pipewire::spa::param::ParamType::EnumFormat.as_raw(),
+        properties: audio_info.into(),
+    };
+    let values: Vec<u8> = pipewire::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pipewire::spa::pod::Value::Object(obj),
+    )
+    .map(|(cursor, _)| cursor.into_inner())
+    .unwrap_or_default();
+
+    if let Some(pod) = Pod::from_bytes(&values) {
+        let mut params = [pod];
+        let _ = stream.connect(
+            Direction::Input,
+            None,
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+            &mut params,
+        );
+    }
+
+    gen.meter_sessions.insert(session_id, MeterSession { stream, listener });
 }

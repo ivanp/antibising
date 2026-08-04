@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>antibising</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, sans-serif;
+        background: #1a1b26;
+        color: #c0caf5;
+        padding: 16px;
+        font-size: 14px;
+      }
+      h1 {
+        font-size: 15px;
+        font-weight: 600;
+        margin: 0 0 12px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        display: inline-block;
+        background: #565f89;
+      }
+      .dot.linked { background: #9ece6a; }
+      .dot.silent { background: #e0af68; }
+      .dot.broken { background: #f7768e; }
+      .dot.reconnecting { background: #7aa2f7; }
+      .dot.unreachable { background: #414868; }
+      #health-text { font-weight: 400; font-size: 13px; color: #a9b1d6; }
+      section {
+        background: #24283b;
+        border-radius: 8px;
+        padding: 12px;
+        margin-bottom: 10px;
+      }
+      label { display: block; font-size: 12px; color: #a9b1d6; margin-bottom: 6px; }
+      select, button {
+        width: 100%;
+        background: #1a1b26;
+        color: #c0caf5;
+        border: 1px solid #414868;
+        border-radius: 6px;
+        padding: 8px;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button.active { background: #3d59a1; border-color: #7aa2f7; }
+      button.warning { border-color: #e0af68; }
+      .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+      .row + .row { margin-top: 8px; }
+      input[type="range"] { flex: 1; accent-color: #7aa2f7; }
+      #threshold-value { font-variant-numeric: tabular-nums; width: 2.5em; text-align: right; }
+      #speech-meter {
+        height: 8px;
+        border-radius: 4px;
+        background: #1a1b26;
+        overflow: hidden;
+        margin-top: 8px;
+      }
+      #speech-meter > div {
+        height: 100%;
+        width: 0%;
+        background: #9ece6a;
+        transition: width 60ms linear;
+      }
+      #monitor-warning {
+        font-size: 12px;
+        color: #e0af68;
+        margin-top: 6px;
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <h1><span class="dot" id="health-dot"></span><span id="health-text">Connecting…</span></h1>
+
+    <section>
+      <label for="device-select">Input</label>
+      <select id="device-select"></select>
+    </section>
+
+    <section>
+      <div class="row">
+        <label for="denoise-toggle" style="margin:0">Denoise</label>
+        <button id="denoise-toggle">Off</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <label for="threshold-slider" style="margin:0; flex-shrink:0">Strength</label>
+        <input type="range" id="threshold-slider" min="0" max="99" step="1" value="50" />
+        <span id="threshold-value">50</span>
+      </div>
+    </section>
+
+    <section>
+      <button id="monitor-button">Hear yourself</button>
+      <div id="monitor-warning">⚠ Monitoring to a speaker may cause feedback.</div>
+      <div id="speech-meter"><div id="speech-meter-bar"></div></div>
+    </section>
+
+    <script>
+      const { invoke } = window.__TAURI__.core;
+      const { listen } = window.__TAURI__.event;
+
+      const DAEMON_EVENT = 'antibising://daemon-event';
+      const CONNECTION_EVENT = 'antibising://connection-state';
+
+      const healthDot = document.querySelector('#health-dot');
+      const healthText = document.querySelector('#health-text');
+      const deviceSelect = document.querySelector('#device-select');
+      const denoiseToggle = document.querySelector('#denoise-toggle');
+      const thresholdSlider = document.querySelector('#threshold-slider');
+      const thresholdValue = document.querySelector('#threshold-value');
+      const monitorButton = document.querySelector('#monitor-button');
+      const monitorWarning = document.querySelector('#monitor-warning');
+      const speechMeterBar = document.querySelector('#speech-meter-bar');
+
+      // Panel-local mirror of daemon-verified state (R5: never assert
+      // anything the daemon hasn't confirmed). `pin` is the persisted
+      // pin string, `devices` the known set -- both come only from
+      // Snapshot/DeviceArrived/DeviceDeparted, never guessed locally.
+      let devices = new Map(); // id -> description
+      let pin = null;
+      let monitoring = false;
+
+      function renderHealth(health) {
+        healthDot.className = 'dot';
+        if (health === 'SilentNoDevice') {
+          healthDot.classList.add('silent');
+          healthText.textContent = 'No microphone';
+        } else if (health === 'Reconnecting') {
+          healthDot.classList.add('reconnecting');
+          healthText.textContent = 'Reconnecting…';
+        } else if (health && health.Linked) {
+          healthDot.classList.add('linked');
+          healthText.textContent = health.Linked.description;
+        } else if (health && health.Broken) {
+          healthDot.classList.add('broken');
+          healthText.textContent = health.Broken.reason;
+        } else {
+          healthText.textContent = 'Unknown';
+        }
+      }
+
+      function renderDeviceSelect() {
+        deviceSelect.innerHTML = '';
+        const auto = document.createElement('option');
+        auto.value = '';
+        auto.textContent = 'Auto (ranked)';
+        deviceSelect.appendChild(auto);
+        for (const [id, description] of devices) {
+          const opt = document.createElement('option');
+          opt.value = id;
+          opt.textContent = description;
+          deviceSelect.appendChild(opt);
+        }
+        deviceSelect.value = pin ?? '';
+      }
+
+      function applySnapshot(snapshot) {
+        devices = new Map(snapshot.devices.map((d) => [d.id, d.description]));
+        pin = snapshot.config.pin;
+        renderDeviceSelect();
+        renderHealth(snapshot.health);
+        const denoiseOn = snapshot.config.denoise_enabled && snapshot.config.dry_mix < 1;
+        denoiseToggle.textContent = denoiseOn ? 'On' : 'Off';
+        denoiseToggle.classList.toggle('active', denoiseOn);
+        thresholdSlider.value = snapshot.config.vad_threshold;
+        thresholdValue.textContent = Math.round(snapshot.config.vad_threshold);
+      }
+
+      // Every daemon Event is internally tagged (`{"type": "...", ...}`,
+      // matching `daemon/src/ipc.rs`'s `#[serde(tag = "type")]`): fields
+      // of a struct-shaped variant land flat on the payload alongside
+      // `type` (e.g. `device_departed` -> `payload.id`); a variant
+      // wrapping another enum (like `HealthStatus`) keeps that inner
+      // enum's own default serde shape -- a bare string for a unit
+      // variant, `{"VariantName": {...}}` for one carrying fields (see
+      // `renderHealth`).
+      listen(DAEMON_EVENT, (event) => {
+        const payload = event.payload;
+        switch (payload.type) {
+          case 'hello':
+            break;
+          case 'snapshot':
+            applySnapshot(payload);
+            break;
+          case 'device_arrived':
+            devices.set(payload.id, payload.description);
+            renderDeviceSelect();
+            break;
+          case 'device_departed':
+            devices.delete(payload.id);
+            renderDeviceSelect();
+            break;
+          case 'health_changed':
+            renderHealth(payload.SilentNoDevice !== undefined ? 'SilentNoDevice'
+              : payload.Reconnecting !== undefined ? 'Reconnecting'
+              : payload.Linked ? { Linked: payload.Linked }
+              : payload.Broken ? { Broken: payload.Broken }
+              : payload);
+            break;
+          case 'monitor_started':
+            monitoring = true;
+            monitorButton.textContent = 'Stop monitoring';
+            monitorButton.classList.add('active');
+            monitorWarning.style.display = payload.speaker_risk === 'LikelySpeaker' ? 'block' : 'none';
+            break;
+          case 'monitor_failed':
+            monitoring = false;
+            monitorButton.textContent = 'Hear yourself';
+            monitorButton.classList.remove('active');
+            monitorWarning.style.display = 'none';
+            healthText.textContent = `Monitor failed: ${payload.reason}`;
+            break;
+          case 'monitor_stopped':
+            monitoring = false;
+            monitorButton.textContent = 'Hear yourself';
+            monitorButton.classList.remove('active');
+            monitorWarning.style.display = 'none';
+            break;
+          case 'meter_frame': {
+            const pct = Math.min(100, Math.round(payload.rms * 200));
+            speechMeterBar.style.width = pct + '%';
+            break;
+          }
+          case 'error':
+            console.error('daemon error:', payload.message);
+            break;
+        }
+      });
+
+      listen(CONNECTION_EVENT, (event) => {
+        if (event.payload === 'unreachable') {
+          healthDot.className = 'dot unreachable';
+          healthText.textContent = 'Daemon unreachable';
+        }
+        // 'connected' is followed immediately by the daemon's own
+        // Hello+Snapshot, which renderHealth/applySnapshot already
+        // handle -- nothing extra to render here.
+      });
+
+      deviceSelect.addEventListener('change', () => {
+        const value = deviceSelect.value;
+        invoke('set_pin', { device: value === '' ? null : value });
+      });
+
+      denoiseToggle.addEventListener('click', () => {
+        const nextEnabled = denoiseToggle.textContent === 'Off';
+        invoke('toggle_denoise', { enabled: nextEnabled });
+      });
+
+      thresholdSlider.addEventListener('input', () => {
+        thresholdValue.textContent = thresholdSlider.value;
+      });
+      thresholdSlider.addEventListener('change', () => {
+        invoke('set_threshold', { value: Number(thresholdSlider.value) });
+      });
+
+      monitorButton.addEventListener('click', () => {
+        invoke(monitoring ? 'stop_monitor' : 'start_monitor');
+      });
+
+      document.addEventListener('DOMContentLoaded', async () => {
+        // Closes the real startup race: the daemon's Hello+Snapshot (or
+        // even a disconnect) can fire on the bridge thread before this
+        // listener registration above completes, and Tauri's event bus
+        // does not queue for late listeners. `pull_state` recovers
+        // whatever the bridge already observed so the panel never gets
+        // stuck on "Connecting..." forever.
+        try {
+          const [connection, snapshot] = await invoke('pull_state');
+          if (connection === 'unreachable') {
+            healthDot.className = 'dot unreachable';
+            healthText.textContent = 'Daemon unreachable';
+          }
+          if (snapshot) {
+            applySnapshot(snapshot);
+          }
+        } catch (e) {
+          console.error('pull_state failed', e);
+        }
+        invoke('request_snapshot').catch((e) => console.error('request_snapshot failed', e));
+      });
+    </script>
+  </body>
+</html>

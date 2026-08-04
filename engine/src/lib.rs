@@ -5,7 +5,9 @@
 pub mod config;
 pub mod fragment;
 pub mod install;
+pub mod meter;
 pub mod model;
+pub mod monitor;
 pub mod params;
 pub mod reconcile;
 pub mod routing;
@@ -17,6 +19,8 @@ pub use fragment::{
     DEFAULT_LADSPA_PLUGIN_PATH,
 };
 pub use install::{classify_startup, install, is_unit_active, uninstall, InstallPaths, StartupAction};
+pub use meter::{compute_frame, MeterChannel, MeterFrame};
 pub use model::{compute_health, DeviceId, DeviceInfo, HealthStatus};
+pub use monitor::{assess_speaker_risk, SpeakerRisk};
 pub use params::{build_props_pod, RnnoiseParam};
 pub use session::{Session, SessionCommand, SessionEvent};

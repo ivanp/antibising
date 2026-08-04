@@ -5,9 +5,28 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# antibisingd's ipc module (Request/Event/IpcPaths) — the bridge speaks the
+# daemon's own wire types directly rather than re-declaring a parallel
+# protocol that could silently drift out of sync (U10's own contract).
+antibisingd = { path = "../daemon" }
+engine = { path = "../engine" }
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
+# ksni (KTD3): Tauri v2's Linux tray relies on libappindicator, which
+# never delivers click events to the app (verified in
+# docs/ksni-tauri-coexistence.md) — ksni is a pure-D-Bus replacement run
+# on its own tokio task. Default `tokio` feature per the plan's decision
+# (Tauri already ships its own tokio runtime).
+ksni = "0.3"
+# tauri-plugin-single-instance (U9): a manual `pin`/`preference_order`
+# and the daemon's own IPC flock already make a *second daemon*
+# instance refuse to start (U10's `bind_singleton`) — this plugin is
+# the app-side analogue, so launching the tray app twice (e.g. desktop
+# double-click while it's already running) focuses/shows the existing
+# window instead of spawning a duplicate tray icon and a duplicate ksni
+# D-Bus registration.
+tauri-plugin-single-instance = "2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

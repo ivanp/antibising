@@ -1,0 +1,27 @@
+{
+  "productName": "antibising",
+  "version": "0.1.0",
+  "identifier": "dev.antibising.app",
+  "build": {
+    "frontendDist": "index.html"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "antibising",
+        "width": 360,
+        "height": 420,
+        "resizable": false,
+        "fullscreen": false,
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

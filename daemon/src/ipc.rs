@@ -41,10 +41,13 @@
 
 use engine::{Config, HealthStatus, SessionCommand, SessionEvent};
 use fs2::FileExt;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Protocol version this daemon build speaks. Carried in the hello message
 /// so a future second client generation can detect a mismatch and
@@ -174,6 +177,24 @@ pub enum Request {
     /// `true` = suppression on (`Dry Mix=0.0`), `false` = clean
     /// passthrough (`Dry Mix=1.0`).
     ToggleDenoise { enabled: bool },
+    /// Start hear-yourself monitoring (U6/R9) for this connection: links
+    /// the permanent source's output to the current default sink's
+    /// input. Bound to this connection's own session id, assigned once
+    /// at connect — `StopMonitor`, or the connection simply dropping,
+    /// releases it. Idempotent to call while already active (the engine
+    /// re-resolves the default sink and replaces the session's links).
+    StartMonitor,
+    /// Stop monitoring for this connection. Idempotent: a no-op if no
+    /// monitor session is active.
+    StopMonitor,
+    /// Subscribe this connection to the live level meter (U6/R9) — an
+    /// engine-side capture stream on the permanent source starts
+    /// producing `Event::MeterFrame`s. Idempotent while already
+    /// subscribed.
+    StartMeter,
+    /// Unsubscribe from the level meter. Idempotent: a no-op if no meter
+    /// session is active.
+    StopMeter,
 }
 
 /// Events pushed from daemon to client. `Snapshot` on connect and on
@@ -194,8 +215,28 @@ pub enum Event {
         config: Config,
     },
     DeviceArrived(engine::DeviceInfo),
-    DeviceDeparted(engine::DeviceId),
+    /// `DeviceId` is a newtype around a bare `String`, which cannot
+    /// serialize as an internally-tagged (`#[serde(tag = "type")]`)
+    /// enum variant when carried as a tuple payload -- serde requires
+    /// every variant's payload to serialize as a map so the tag can be
+    /// merged in. A struct variant sidesteps that entirely.
+    DeviceDeparted { id: engine::DeviceId },
     HealthChanged(HealthStatus),
+    /// This connection's `StartMonitor` succeeded — links exist. Carries
+    /// the R9 speaker-vs-headset assessment as an inline warning (never
+    /// a refusal). Reaches only the requesting connection (per-session,
+    /// like `Error`) via `SessionRegistry`, never broadcast.
+    MonitorStarted { speaker_risk: engine::SpeakerRisk },
+    /// This connection's `StartMonitor` could not proceed (e.g. no
+    /// default sink resolved yet). Per-session, not broadcast.
+    MonitorFailed { reason: String },
+    /// This connection's monitor session ended — explicit `StopMonitor`,
+    /// or implied by disconnect. Per-session, not broadcast.
+    MonitorStopped,
+    /// One live level-meter measurement (U6/R9), pushed only to
+    /// connections currently subscribed via `StartMeter` — never
+    /// broadcast to clients that never asked for it.
+    MeterFrame(engine::MeterFrame),
     /// A request this connection sent was malformed or invalid — sent
     /// only to the connection that sent it; the connection survives (per
     /// the plan's own test scenario: malformed message -> error reply,
@@ -276,6 +317,77 @@ impl Broadcaster {
     }
 }
 
+/// Assigns each accepted connection a stable `u64` session id — the same
+/// identity `StartMonitor`/`StartMeter` bind their engine-side session to
+/// (`SessionCommand::StartMonitor(session_id)` etc.), and the key
+/// `SessionRegistry` and the engine's own `MonitorStarted`/`MonitorFailed`/
+/// `MonitorStopped` events route back on. Distinct from any engine-side
+/// device identity; monotonic for the daemon process's lifetime, so ids
+/// are never reused even across reconnects.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_session_id() -> u64 {
+    NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// How often a subscribed connection's meter-frame drain thread wakes to
+/// push queued frames to its client (R9's own ~50ms per-frame cadence)
+/// — fast enough to feel live, without a busy-spin.
+const METER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Capacity of a per-client meter-frame channel: small and bounded, per
+/// the plan's own rule ("meter frames never block the pw thread ... a
+/// slow or busy client loses frames, never stalls audio-side event
+/// processing"). A few poll intervals' worth of headroom for jitter,
+/// never unbounded growth.
+const METER_CHANNEL_CAPACITY: usize = 8;
+
+/// Routes engine events and meter frames that are scoped to **one**
+/// connection — never broadcast — back to that connection's own writer.
+/// `Broadcaster` fans device/health deltas out to everyone; this is the
+/// opposite shape: `StartMonitor`/`StartMeter`'s `MonitorStarted` /
+/// `MonitorFailed` / `MonitorStopped` / `MeterFrame` replies must reach
+/// only the requesting client, keyed by the `session_id` assigned at
+/// accept time.
+#[derive(Clone, Default)]
+pub struct SessionRegistry {
+    sessions: Arc<Mutex<HashMap<u64, ClientWriter>>>,
+}
+
+impl SessionRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn register(&self, session_id: u64, writer: ClientWriter) {
+        self.sessions
+            .lock()
+            .expect("session registry mutex poisoned")
+            .insert(session_id, writer);
+    }
+
+    fn unregister(&self, session_id: u64) {
+        self.sessions
+            .lock()
+            .expect("session registry mutex poisoned")
+            .remove(&session_id);
+    }
+
+    /// Send `event` to exactly the connection identified by
+    /// `session_id`. A `session_id` with no registered connection (the
+    /// client already disconnected, racing the engine's own eventual
+    /// reaction) is a silent no-op — not an error, since disconnect
+    /// cleanup already tore that session down from the engine's side
+    /// too.
+    pub fn send_to(&self, session_id: u64, event: &Event) {
+        let sessions = self.sessions.lock().expect("session registry mutex poisoned");
+        if let Some(writer) = sessions.get(&session_id) {
+            let mut stream = writer.lock().expect("client writer mutex poisoned");
+            let _ = write_event(&mut stream, event);
+        }
+    }
+}
+
 /// Translate a client `Request` into the engine command(s) it implies,
 /// plus any config mutation. Pure with respect to socket I/O (no reads,
 /// no writes here — only the `mpsc::Sender` into the engine and the
@@ -288,27 +400,41 @@ impl Broadcaster {
 /// successful JSON deserialization), so this is `Result` for forward
 /// compatibility with a future request that can be rejected, not because
 /// today's variants exercise the error path.
+/// Returns `Ok(true)` when `config` was mutated (so the caller should
+/// broadcast a fresh `Snapshot` -- `SetPin`/`SetPreferenceOrder`/
+/// `SetThreshold`/`ToggleDenoise`), `Ok(false)` for requests that never
+/// touch `config` (`RequestSnapshot`, `StartMonitor`/`StopMonitor`,
+/// `StartMeter`/`StopMeter` -- these already have their own
+/// confirmation path: `MonitorStarted`/`MonitorFailed`/`MonitorStopped`
+/// reach only the requester via `SessionRegistry`, `MeterFrame`s stream
+/// to only the subscriber. Broadcasting a Snapshot on every one of
+/// those would both be redundant (nothing in it changed) and would
+/// leak that per-session reply's timing to every *other* connected
+/// client, which the existing `start_monitor_forwards_command_and_
+/// routes_reply_to_requester_only` test explicitly guards against.
 pub fn apply_request(
     request: Request,
     config: &mut Config,
     session_cmd_tx: &std::sync::mpsc::Sender<SessionCommand>,
-) -> Result<(), String> {
+    session_id: u64,
+    meter_slot: &Arc<Mutex<Option<Arc<Mutex<engine::MeterChannel>>>>>,
+) -> Result<bool, String> {
     match request {
         Request::RequestSnapshot => {
             let _ = session_cmd_tx.send(SessionCommand::RequestSnapshot);
-            Ok(())
+            Ok(false)
         }
         Request::SetPin { device } => {
             config.pin = device.clone();
             let pin = device.map(engine::DeviceId);
             let _ = session_cmd_tx.send(SessionCommand::SetPin(pin));
-            Ok(())
+            Ok(true)
         }
         Request::SetPreferenceOrder { order } => {
             config.preference_order = order.clone();
             let ids: Vec<engine::DeviceId> = order.into_iter().map(engine::DeviceId).collect();
             let _ = session_cmd_tx.send(SessionCommand::SetPreferenceOrder(ids));
-            Ok(())
+            Ok(true)
         }
         Request::SetThreshold { value } => {
             let clamped = engine::RnnoiseParam::VadThreshold.clamp(value as f32);
@@ -317,7 +443,7 @@ pub fn apply_request(
                 engine::RnnoiseParam::VadThreshold,
                 clamped,
             ));
-            Ok(())
+            Ok(true)
         }
         Request::ToggleDenoise { enabled } => {
             // R6: Dry Mix is the toggle. enabled=true means suppression
@@ -332,23 +458,52 @@ pub fn apply_request(
                 engine::RnnoiseParam::DryMix,
                 dry_mix as f32,
             ));
-            Ok(())
+            Ok(true)
+        }
+        Request::StartMonitor => {
+            let _ = session_cmd_tx.send(SessionCommand::StartMonitor(session_id));
+            Ok(false)
+        }
+        Request::StopMonitor => {
+            let _ = session_cmd_tx.send(SessionCommand::StopMonitor(session_id));
+            Ok(false)
+        }
+        Request::StartMeter => {
+            // A fresh channel every StartMeter (including a re-subscribe
+            // after StopMeter) -- the engine's own StartMeter session
+            // owns exactly the channel it was handed, so replacing the
+            // slot here and sending the new Arc keeps both sides
+            // pointing at the same live queue.
+            let channel = Arc::new(Mutex::new(engine::MeterChannel::new(METER_CHANNEL_CAPACITY)));
+            *meter_slot.lock().expect("meter slot mutex poisoned") = Some(channel.clone());
+            let _ = session_cmd_tx.send(SessionCommand::StartMeter(session_id, channel));
+            Ok(false)
+        }
+        Request::StopMeter => {
+            *meter_slot.lock().expect("meter slot mutex poisoned") = None;
+            let _ = session_cmd_tx.send(SessionCommand::StopMeter(session_id));
+            Ok(false)
         }
     }
 }
 
-/// Handle one connected client for its whole lifetime: send `Hello` +
-/// initial `Snapshot`, register for broadcasts, then loop reading
-/// `Request` lines until the client disconnects (clean or killed — both
-/// surface as a read error, the signal to stop and let the thread exit;
-/// no monitor/meter session exists yet in U10 to release — that's U6's
-/// job, binding into this same connection lifecycle later).
+/// Handle one connected client for its whole lifetime: assign it a
+/// session id, send `Hello` + initial `Snapshot`, register for
+/// broadcasts and per-session routing, then loop reading `Request` lines
+/// until the client disconnects (clean or killed — both surface as a
+/// read error). On exit, always releases any monitor/meter session this
+/// connection held (U6/R9: "never survives app exit," enforced at the
+/// daemon boundary, not left to the client to ask nicely) and stops the
+/// meter-frame drain thread.
 fn handle_client(
     mut stream: UnixStream,
     shared: Arc<Mutex<SharedState>>,
     broadcaster: Broadcaster,
+    session_registry: SessionRegistry,
     session_cmd_tx: std::sync::mpsc::Sender<SessionCommand>,
 ) {
+    let session_id = next_session_id();
+
     if write_event(
         &mut stream,
         &Event::Hello {
@@ -371,6 +526,37 @@ fn handle_client(
         Err(_) => return,
     };
     broadcaster.register(write_handle.clone());
+    session_registry.register(session_id, write_handle.clone());
+
+    // Meter drain thread: while `meter_slot` holds a channel (set by
+    // `StartMeter`, cleared by `StopMeter`), wake on `METER_POLL_INTERVAL`
+    // and push every queued frame to this client — a per-connection
+    // thread rather than a shared poller, so a slow client's writes never
+    // hold up another client's meter delivery. Exits with the connection
+    // (the `Arc<AtomicBool>` stop flag is set right before this function
+    // returns, in the cleanup below).
+    let meter_slot: Arc<Mutex<Option<Arc<Mutex<engine::MeterChannel>>>>> =
+        Arc::new(Mutex::new(None));
+    let meter_stop = Arc::new(AtomicBool::new(false));
+    let drain_handle = {
+        let meter_slot = meter_slot.clone();
+        let meter_stop = meter_stop.clone();
+        let write_handle = write_handle.clone();
+        std::thread::spawn(move || {
+            while !meter_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(METER_POLL_INTERVAL);
+                let channel = meter_slot.lock().expect("meter slot mutex poisoned").clone();
+                let Some(channel) = channel else { continue };
+                let frames = channel.lock().expect("meter channel mutex poisoned").drain();
+                for frame in frames {
+                    let mut w = write_handle.lock().expect("client writer mutex poisoned");
+                    if write_event(&mut w, &Event::MeterFrame(frame)).is_err() {
+                        return; // client gone; the read loop will notice too
+                    }
+                }
+            }
+        })
+    };
 
     let reader = BufReader::new(stream);
     for line in reader.lines() {
@@ -384,11 +570,43 @@ fn handle_client(
         match serde_json::from_str::<Request>(&line) {
             Ok(request) => {
                 let mut state = shared.lock().expect("shared state mutex poisoned");
-                match apply_request(request, &mut state.config, &session_cmd_tx) {
-                    Ok(()) => {
-                        let content = toml::to_string_pretty(&state.config)
-                            .expect("Config must always serialize to TOML");
-                        let _ = engine::write_atomic(&state.config_path, &content);
+                match apply_request(request, &mut state.config, &session_cmd_tx, session_id, &meter_slot) {
+                    Ok(config_changed) => {
+                        if config_changed {
+                            let content = toml::to_string_pretty(&state.config)
+                                .expect("Config must always serialize to TOML");
+                            let _ = engine::write_atomic(&state.config_path, &content);
+                            // R3/U7's own contract: "dropdown reflects pinned
+                            // state on the engine's confirmation event, not
+                            // optimistically" -- and the panel's denoise
+                            // button/threshold slider read back only from
+                            // Snapshot too (index.html's applySnapshot).
+                            // Without this broadcast, a successful mutation
+                            // was applied to the daemon's config and to
+                            // PipeWire (verified live: the persisted config
+                            // and the running rnnoise:Dry Mix param both
+                            // changed) but every connected client --
+                            // including the very one that sent the request
+                            // -- never learned that, so a control bound to
+                            // "toggle from last-known state" could resend
+                            // the same value forever. Broadcasting the full
+                            // Snapshot (not a narrower delta) matches this
+                            // file's own doc comment on Snapshot being
+                            // "enough for a client to render its whole UI
+                            // with no further round-trips" and needs no new
+                            // Event variant. Gated on `config_changed` (only
+                            // `apply_request`'s config-mutating branches
+                            // return `true`) -- StartMonitor/StopMonitor/
+                            // StartMeter/StopMeter never touch `config` and
+                            // already have their own per-session reply path
+                            // (MonitorStarted/MonitorFailed/MonitorStopped/
+                            // MeterFrame via SessionRegistry), which an
+                            // unconditional broadcast here would both
+                            // duplicate and leak to every other client.
+                            let snapshot = state.snapshot_event();
+                            drop(state);
+                            broadcaster.broadcast(&snapshot);
+                        }
                     }
                     Err(message) => {
                         let mut w = write_handle.lock().expect("client writer mutex poisoned");
@@ -409,11 +627,23 @@ fn handle_client(
         }
     }
 
-    // Reader loop exited (client gone). The broadcaster still holds
-    // `write_handle` until its *next* broadcast attempt fails and prunes
-    // it (Broadcaster::broadcast's retain) — a bounded, self-healing
-    // cleanup rather than requiring this thread to reach back into the
-    // broadcaster's client list itself.
+    // Reader loop exited (client gone, clean or killed). Release
+    // exactly this connection's engine-side sessions -- R9's "never
+    // survives app exit" enforced here at the daemon boundary rather
+    // than depending on the client sending StopMonitor/StopMeter first.
+    // Idempotent on the engine side even if this connection never
+    // started either.
+    let _ = session_cmd_tx.send(SessionCommand::StopMonitor(session_id));
+    let _ = session_cmd_tx.send(SessionCommand::StopMeter(session_id));
+    session_registry.unregister(session_id);
+    meter_stop.store(true, Ordering::Relaxed);
+    let _ = drain_handle.join();
+
+    // The broadcaster still holds `write_handle` until its *next*
+    // broadcast attempt fails and prunes it (Broadcaster::broadcast's
+    // retain) — a bounded, self-healing cleanup rather than requiring
+    // this thread to reach back into the broadcaster's client list
+    // itself.
 }
 
 /// Accept loop: one thread per connection. Spawned by the daemon's main
@@ -422,6 +652,7 @@ pub fn accept_loop(
     listener: UnixListener,
     shared: Arc<Mutex<SharedState>>,
     broadcaster: Broadcaster,
+    session_registry: SessionRegistry,
     session_cmd_tx: std::sync::mpsc::Sender<SessionCommand>,
 ) {
     for connection in listener.incoming() {
@@ -431,8 +662,11 @@ pub fn accept_loop(
         };
         let shared = shared.clone();
         let broadcaster = broadcaster.clone();
+        let session_registry = session_registry.clone();
         let session_cmd_tx = session_cmd_tx.clone();
-        std::thread::spawn(move || handle_client(stream, shared, broadcaster, session_cmd_tx));
+        std::thread::spawn(move || {
+            handle_client(stream, shared, broadcaster, session_registry, session_cmd_tx)
+        });
     }
 }
 
@@ -445,7 +679,12 @@ pub fn accept_loop(
 /// reconnect would be state the client already has, framed as a delta.
 /// `Disconnected` maps to a `HealthChanged(Reconnecting)` broadcast so
 /// clients see the transient without a raw internal-event leak.
-pub fn handle_session_event(shared: &Arc<Mutex<SharedState>>, broadcaster: &Broadcaster, event: SessionEvent) {
+pub fn handle_session_event(
+    shared: &Arc<Mutex<SharedState>>,
+    broadcaster: &Broadcaster,
+    session_registry: &SessionRegistry,
+    event: SessionEvent,
+) {
     match event {
         SessionEvent::DeviceArrived(info) => {
             let mut state = shared.lock().expect("shared state mutex poisoned");
@@ -457,7 +696,7 @@ pub fn handle_session_event(shared: &Arc<Mutex<SharedState>>, broadcaster: &Broa
             let mut state = shared.lock().expect("shared state mutex poisoned");
             state.devices.remove(&id);
             drop(state);
-            broadcaster.broadcast(&Event::DeviceDeparted(id));
+            broadcaster.broadcast(&Event::DeviceDeparted { id });
         }
         SessionEvent::Snapshot(devices) => {
             let mut state = shared.lock().expect("shared state mutex poisoned");
@@ -475,6 +714,15 @@ pub fn handle_session_event(shared: &Arc<Mutex<SharedState>>, broadcaster: &Broa
             drop(state);
             broadcaster.broadcast(&Event::HealthChanged(HealthStatus::Reconnecting));
         }
+        SessionEvent::MonitorStarted { session_id, speaker_risk } => {
+            session_registry.send_to(session_id, &Event::MonitorStarted { speaker_risk });
+        }
+        SessionEvent::MonitorFailed { session_id, reason } => {
+            session_registry.send_to(session_id, &Event::MonitorFailed { reason });
+        }
+        SessionEvent::MonitorStopped { session_id } => {
+            session_registry.send_to(session_id, &Event::MonitorStopped);
+        }
     }
 }
 
@@ -486,11 +734,24 @@ mod tests {
         Config::default()
     }
 
+    /// Test-only wrapper: most `apply_request` tests exercise requests
+    /// that don't touch `session_id`/`meter_slot` at all, so a fixed
+    /// dummy session id and a throwaway slot keep those call sites
+    /// exactly as terse as before the U6 signature extension.
+    fn test_apply(
+        request: Request,
+        config: &mut Config,
+        tx: &std::sync::mpsc::Sender<SessionCommand>,
+    ) -> Result<bool, String> {
+        let meter_slot = Arc::new(Mutex::new(None));
+        apply_request(request, config, tx, 0, &meter_slot)
+    }
+
     #[test]
     fn set_pin_updates_config_and_forwards_command() {
         let mut config = test_config();
         let (tx, rx) = std::sync::mpsc::channel();
-        apply_request(
+        test_apply(
             Request::SetPin {
                 device: Some("dev-a".to_string()),
             },
@@ -510,7 +771,7 @@ mod tests {
         let mut config = test_config();
         config.pin = Some("dev-a".to_string());
         let (tx, rx) = std::sync::mpsc::channel();
-        apply_request(Request::SetPin { device: None }, &mut config, &tx).unwrap();
+        test_apply(Request::SetPin { device: None }, &mut config, &tx).unwrap();
         assert_eq!(config.pin, None);
         match rx.try_recv().unwrap() {
             SessionCommand::SetPin(None) => {}
@@ -522,7 +783,7 @@ mod tests {
     fn set_preference_order_updates_config_and_forwards_command() {
         let mut config = test_config();
         let (tx, rx) = std::sync::mpsc::channel();
-        apply_request(
+        test_apply(
             Request::SetPreferenceOrder {
                 order: vec!["dev-a".to_string(), "dev-b".to_string()],
             },
@@ -543,7 +804,7 @@ mod tests {
     fn set_threshold_clamps_and_updates_config() {
         let mut config = test_config();
         let (tx, rx) = std::sync::mpsc::channel();
-        apply_request(Request::SetThreshold { value: 150.0 }, &mut config, &tx).unwrap();
+        test_apply(Request::SetThreshold { value: 150.0 }, &mut config, &tx).unwrap();
         // VadThreshold's valid range is 0.0-99.0 (params.rs) -- 150 must clamp.
         assert_eq!(config.vad_threshold, 99.0);
         match rx.try_recv().unwrap() {
@@ -558,7 +819,7 @@ mod tests {
     fn toggle_denoise_on_sets_dry_mix_zero_and_enables_graph() {
         let mut config = test_config();
         let (tx, rx) = std::sync::mpsc::channel();
-        apply_request(Request::ToggleDenoise { enabled: true }, &mut config, &tx).unwrap();
+        test_apply(Request::ToggleDenoise { enabled: true }, &mut config, &tx).unwrap();
         assert_eq!(config.dry_mix, 0.0);
         assert!(config.denoise_enabled);
         match rx.try_recv().unwrap() {
@@ -573,7 +834,7 @@ mod tests {
     fn toggle_denoise_off_sets_dry_mix_one() {
         let mut config = test_config();
         let (tx, rx) = std::sync::mpsc::channel();
-        apply_request(Request::ToggleDenoise { enabled: false }, &mut config, &tx).unwrap();
+        test_apply(Request::ToggleDenoise { enabled: false }, &mut config, &tx).unwrap();
         assert_eq!(config.dry_mix, 1.0);
         match rx.try_recv().unwrap() {
             SessionCommand::SetRnnoiseParam(engine::RnnoiseParam::DryMix, value) => {
@@ -588,7 +849,7 @@ mod tests {
         let mut config = test_config();
         let before = config.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        apply_request(Request::RequestSnapshot, &mut config, &tx).unwrap();
+        test_apply(Request::RequestSnapshot, &mut config, &tx).unwrap();
         assert_eq!(config, before);
         assert!(matches!(rx.try_recv().unwrap(), SessionCommand::RequestSnapshot));
     }
@@ -618,6 +879,47 @@ mod tests {
                 assert_eq!(description, "Razer Seiren Mini");
             }
             _ => panic!("round-trip changed variant"),
+        }
+    }
+
+    /// The exact bug this test exists to catch: `DeviceDeparted` used to
+    /// be a tuple variant wrapping `DeviceId` (a newtype around a bare
+    /// `String`), which cannot serialize under `#[serde(tag = "type")]`
+    /// internal tagging -- serde requires every variant's payload to
+    /// serialize as a JSON object so the tag can be merged in, and a
+    /// bare string payload has nowhere to put it. `write_event`'s
+    /// `.expect(...)` meant a live daemon would panic the instant any
+    /// device departed (unplugging a mic) -- exercising every variant's
+    /// serialization here is cheap insurance against the same class of
+    /// mistake landing on a future variant.
+    #[test]
+    fn every_event_variant_serializes_without_panicking() {
+        let device_info = engine::DeviceInfo {
+            id: engine::DeviceId("dev-a".to_string()),
+            node_id: 1,
+            description: "Razer".to_string(),
+        };
+        let variants = [
+            Event::Hello { protocol_version: PROTOCOL_VERSION },
+            Event::Snapshot {
+                devices: vec![device_info.clone()],
+                health: HealthStatus::SilentNoDevice,
+                config: test_config(),
+            },
+            Event::DeviceArrived(device_info.clone()),
+            Event::DeviceDeparted { id: device_info.id.clone() },
+            Event::HealthChanged(HealthStatus::SilentNoDevice),
+            Event::MonitorStarted { speaker_risk: engine::SpeakerRisk::Unknown },
+            Event::MonitorFailed { reason: "no default sink".to_string() },
+            Event::MonitorStopped,
+            Event::MeterFrame(engine::MeterFrame { rms: 0.1, peak: 0.2 }),
+            Event::Error { message: "malformed request".to_string() },
+        ];
+        for event in variants {
+            let json = serde_json::to_string(&event)
+                .unwrap_or_else(|e| panic!("{event:?} failed to serialize: {e}"));
+            let _: Event = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("{event:?} round-trip failed to deserialize: {e}"));
         }
     }
 

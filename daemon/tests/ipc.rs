@@ -10,7 +10,7 @@
 
 use antibisingd::ipc::{
     accept_loop, bind_singleton, handle_session_event, Broadcaster, Event, IpcPaths, Request,
-    SharedState,
+    SessionRegistry, SharedState,
 };
 use engine::{Config, DeviceId, DeviceInfo, HealthStatus, SessionEvent};
 use std::io::{BufRead, BufReader, Write};
@@ -60,6 +60,7 @@ fn start_test_server() -> (
     std::sync::mpsc::Receiver<engine::SessionCommand>,
     Arc<Mutex<SharedState>>,
     Broadcaster,
+    SessionRegistry,
     ScratchGuard,
 ) {
     let dir = scratch_dir();
@@ -73,15 +74,19 @@ fn start_test_server() -> (
     let config_path = paths.socket_path.with_file_name("config.toml");
     let shared = Arc::new(Mutex::new(SharedState::new(Config::default(), config_path)));
     let broadcaster = Broadcaster::new();
+    let session_registry = SessionRegistry::new();
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
 
     {
         let shared = shared.clone();
         let broadcaster = broadcaster.clone();
-        std::thread::spawn(move || accept_loop(listener, shared, broadcaster, cmd_tx));
+        let session_registry = session_registry.clone();
+        std::thread::spawn(move || {
+            accept_loop(listener, shared, broadcaster, session_registry, cmd_tx)
+        });
     }
 
-    (paths, cmd_rx, shared, broadcaster, guard)
+    (paths, cmd_rx, shared, broadcaster, session_registry, guard)
 }
 
 fn connect(paths: &IpcPaths) -> UnixStream {
@@ -120,7 +125,7 @@ fn send_request(stream: &mut UnixStream, request: &Request) {
 /// prior client activity," the IPC-layer half of that claim.
 #[test]
 fn client_connects_and_receives_hello_then_snapshot() {
-    let (paths, _cmd_rx, _shared, _broadcaster, _guard) = start_test_server();
+    let (paths, _cmd_rx, _shared, _broadcaster, _session_registry, _guard) = start_test_server();
     let stream = connect(&paths);
     let mut reader = BufReader::new(stream);
 
@@ -146,7 +151,7 @@ fn client_connects_and_receives_hello_then_snapshot() {
 /// command from one -> state delta visible to both" scenario.
 #[test]
 fn command_from_one_client_broadcasts_delta_to_both() {
-    let (paths, cmd_rx, shared, broadcaster, _guard) = start_test_server();
+    let (paths, cmd_rx, shared, broadcaster, session_registry, _guard) = start_test_server();
 
     let mut client_a = BufReader::new(connect(&paths));
     read_event(&mut client_a); // Hello
@@ -173,12 +178,29 @@ fn command_from_one_client_broadcasts_delta_to_both() {
         other => panic!("expected SetRnnoiseParam(VadThreshold, 55.0), got a different command: {other:?}"),
     }
 
+    // The daemon must have broadcast a fresh Snapshot to every client
+    // right after SetThreshold's config mutation (this fix's own
+    // regression coverage: without it, a client-facing control bound
+    // to "read the confirmed value back from Snapshot" -- exactly what
+    // the panel's denoise button and threshold slider do -- would
+    // never learn a request it sent actually took effect). Must reach
+    // both clients, not just the sender.
+    for reader in [&mut client_a, &mut client_b] {
+        match read_event(reader) {
+            Event::Snapshot { config, .. } => {
+                assert_eq!(config.vad_threshold, 55.0);
+            }
+            other => panic!("expected Snapshot broadcast after SetThreshold, got {other:?}"),
+        }
+    }
+
     // Simulate the engine reacting with a health change (standing in for
     // what a live Session would eventually emit) and confirm the daemon
     // broadcasts it to every connected client, not just the sender.
     handle_session_event(
         &shared,
         &broadcaster,
+        &session_registry,
         SessionEvent::HealthChanged(HealthStatus::SilentNoDevice),
     );
 
@@ -196,7 +218,7 @@ fn command_from_one_client_broadcasts_delta_to_both() {
 /// itself (the plan's disconnect-cleanup scenario, clean-close half).
 #[test]
 fn client_clean_disconnect_does_not_disrupt_other_clients() {
-    let (paths, _cmd_rx, shared, broadcaster, _guard) = start_test_server();
+    let (paths, _cmd_rx, shared, broadcaster, session_registry, _guard) = start_test_server();
 
     let mut client_a = BufReader::new(connect(&paths));
     read_event(&mut client_a);
@@ -215,6 +237,7 @@ fn client_clean_disconnect_does_not_disrupt_other_clients() {
     handle_session_event(
         &shared,
         &broadcaster,
+        &session_registry,
         SessionEvent::DeviceArrived(DeviceInfo {
             id: DeviceId("dev-a".to_string()),
             node_id: 1,
@@ -232,7 +255,7 @@ fn client_clean_disconnect_does_not_disrupt_other_clients() {
 /// only the sender.
 #[test]
 fn malformed_message_gets_error_reply_and_connection_survives() {
-    let (paths, _cmd_rx, _shared, _broadcaster, _guard) = start_test_server();
+    let (paths, _cmd_rx, _shared, _broadcaster, _session_registry, _guard) = start_test_server();
 
     let mut stream = connect(&paths);
     let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -306,4 +329,177 @@ fn concurrent_bind_second_instance_refused_first_socket_untouched() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `StartMonitor` forwards a `SessionCommand::StartMonitor(session_id)`
+/// (with a session id this daemon itself assigned at connect), and the
+/// resulting `MonitorStarted` reaches *only* the requesting connection —
+/// never broadcast to a second, uninvolved client. Covers the plan's own
+/// "engine confirms monitor state; client sees only its own session's
+/// outcome" contract.
+#[test]
+fn start_monitor_forwards_command_and_routes_reply_to_requester_only() {
+    let (paths, cmd_rx, shared, broadcaster, session_registry, _guard) = start_test_server();
+
+    let mut client_a = BufReader::new(connect(&paths));
+    read_event(&mut client_a); // Hello
+    read_event(&mut client_a); // Snapshot
+
+    let mut client_b = BufReader::new(connect(&paths));
+    read_event(&mut client_b); // Hello
+    read_event(&mut client_b); // Snapshot
+
+    send_request(client_a.get_mut(), &Request::StartMonitor);
+
+    let session_id = match cmd_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("StartMonitor must forward a SessionCommand")
+    {
+        engine::SessionCommand::StartMonitor(id) => id,
+        other => panic!("expected SessionCommand::StartMonitor, got {other:?}"),
+    };
+
+    // Simulate the engine confirming success for exactly this session.
+    handle_session_event(
+        &shared,
+        &broadcaster,
+        &session_registry,
+        SessionEvent::MonitorStarted {
+            session_id,
+            speaker_risk: engine::SpeakerRisk::LikelyHeadphones,
+        },
+    );
+
+    match read_event(&mut client_a) {
+        Event::MonitorStarted { speaker_risk } => {
+            assert_eq!(speaker_risk, engine::SpeakerRisk::LikelyHeadphones);
+        }
+        other => panic!("expected MonitorStarted on the requester, got {other:?}"),
+    }
+
+    // client_b must never see this per-session reply. A subsequent
+    // broadcast-shaped event proves client_b's stream is still alive and
+    // simply never received MonitorStarted -- not that it's stalled.
+    handle_session_event(
+        &shared,
+        &broadcaster,
+        &session_registry,
+        SessionEvent::HealthChanged(HealthStatus::SilentNoDevice),
+    );
+    match read_event(&mut client_b) {
+        Event::HealthChanged(HealthStatus::SilentNoDevice) => {}
+        other => panic!(
+            "client_b's first post-Snapshot event must be the broadcast HealthChanged, \
+             never a leaked MonitorStarted meant for client_a; got {other:?}"
+        ),
+    }
+}
+
+/// `StartMonitor` on a default sink that can't be resolved -> the engine's
+/// `MonitorFailed` reaches the requester with its reason, distinct from
+/// `MonitorStarted`.
+#[test]
+fn start_monitor_failure_reaches_requester_with_reason() {
+    let (paths, cmd_rx, shared, broadcaster, session_registry, _guard) = start_test_server();
+
+    let mut client = BufReader::new(connect(&paths));
+    read_event(&mut client); // Hello
+    read_event(&mut client); // Snapshot
+
+    send_request(client.get_mut(), &Request::StartMonitor);
+    let session_id = match cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+        engine::SessionCommand::StartMonitor(id) => id,
+        other => panic!("expected SessionCommand::StartMonitor, got {other:?}"),
+    };
+
+    handle_session_event(
+        &shared,
+        &broadcaster,
+        &session_registry,
+        SessionEvent::MonitorFailed {
+            session_id,
+            reason: "no default sink resolved yet".to_string(),
+        },
+    );
+
+    match read_event(&mut client) {
+        Event::MonitorFailed { reason } => {
+            assert_eq!(reason, "no default sink resolved yet");
+        }
+        other => panic!("expected MonitorFailed, got {other:?}"),
+    }
+}
+
+/// `StartMeter` forwards a `SessionCommand::StartMeter(session_id,
+/// channel)`; frames pushed onto that channel reach the requesting
+/// client as `Event::MeterFrame`s via the per-connection drain thread —
+/// the daemon-side half of U6's "meter shows motion" scenario (the
+/// motion math itself is `meter.rs`'s own unit tests).
+#[test]
+fn start_meter_forwards_command_and_drains_frames_to_client() {
+    let (paths, cmd_rx, _shared, _broadcaster, _session_registry, _guard) = start_test_server();
+
+    let mut client = BufReader::new(connect(&paths));
+    read_event(&mut client); // Hello
+    read_event(&mut client); // Snapshot
+
+    send_request(client.get_mut(), &Request::StartMeter);
+
+    let channel = match cmd_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("StartMeter must forward a SessionCommand")
+    {
+        engine::SessionCommand::StartMeter(_session_id, channel) => channel,
+        other => panic!("expected SessionCommand::StartMeter, got {other:?}"),
+    };
+
+    // Push a frame the way session.rs's own capture-stream callback
+    // would, standing in for a live engine session.
+    channel
+        .lock()
+        .unwrap()
+        .push(engine::MeterFrame { rms: 0.42, peak: 0.9 });
+
+    match read_event(&mut client) {
+        Event::MeterFrame(frame) => {
+            assert_eq!(frame.rms, 0.42);
+            assert_eq!(frame.peak, 0.9);
+        }
+        other => panic!("expected MeterFrame, got {other:?}"),
+    }
+}
+
+/// R9's own daemon-boundary rule: a client that disconnects (clean or
+/// killed) without ever sending `StopMonitor`/`StopMeter` still gets
+/// both released — "never survives app exit" is enforced by the daemon
+/// on disconnect, not left to the client to ask nicely.
+#[test]
+fn client_disconnect_releases_its_monitor_and_meter_sessions() {
+    let (paths, cmd_rx, _shared, _broadcaster, _session_registry, _guard) = start_test_server();
+
+    {
+        let mut client = BufReader::new(connect(&paths));
+        read_event(&mut client); // Hello
+        read_event(&mut client); // Snapshot
+        send_request(client.get_mut(), &Request::StartMonitor);
+        // Drain the forwarded StartMonitor so it doesn't get confused
+        // with the StopMonitor this test asserts on below.
+        cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // client drops here -> disconnect, clean-close half of R9.
+    }
+
+    // handle_client's cleanup path always sends StopMonitor then
+    // StopMeter on exit, regardless of what this session actually held
+    // -- idempotent on the engine side, and simpler than tracking
+    // per-session what was actually active.
+    let first = cmd_rx.recv_timeout(Duration::from_secs(2)).expect("StopMonitor on disconnect");
+    assert!(
+        matches!(first, engine::SessionCommand::StopMonitor(_)),
+        "expected StopMonitor on disconnect, got {first:?}"
+    );
+    let second = cmd_rx.recv_timeout(Duration::from_secs(2)).expect("StopMeter on disconnect");
+    assert!(
+        matches!(second, engine::SessionCommand::StopMeter(_)),
+        "expected StopMeter on disconnect, got {second:?}"
+    );
 }

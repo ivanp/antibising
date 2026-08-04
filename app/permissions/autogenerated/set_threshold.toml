@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-threshold"
+description = "Enables the set_threshold command without any pre-configured scope."
+commands.allow = ["set_threshold"]
+
+[[permission]]
+identifier = "deny-set-threshold"
+description = "Denies the set_threshold command without any pre-configured scope."
+commands.deny = ["set_threshold"]

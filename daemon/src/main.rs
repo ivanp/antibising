@@ -22,7 +22,7 @@
 
 use antibisingd::ipc::{
     accept_loop, bind_singleton, handle_session_event, BindError, Broadcaster, IpcPaths,
-    SharedState,
+    SessionRegistry, SharedState,
 };
 use engine::{
     classify_startup, install, is_unit_active, uninstall, Config, InstallPaths, StartupAction,
@@ -100,7 +100,7 @@ fn cmd_uninstall() {
 /// ranked-routing mode is a normal, permanent operating state, not
 /// solely a bootstrap artifact — this fallback simply seeds it).
 fn cmd_run() {
-    reconcile_startup();
+    let startup_broken_reason = reconcile_startup();
 
     let config_path = Config::default_path();
     let mut config = Config::load(&config_path).unwrap_or_else(|e| {
@@ -140,16 +140,30 @@ fn cmd_run() {
             std::process::exit(1);
         }
     };
-    let shared = Arc::new(Mutex::new(SharedState::new(
-        config.clone(),
-        config_path.clone(),
-    )));
+    let mut initial_state = SharedState::new(config.clone(), config_path.clone());
+    // U9: a startup repair failure (corrupt fragment still broken after
+    // the fragment-regenerate + one-restart retry) must be visible in
+    // the very first `Snapshot` any IPC client receives -- set it into
+    // `SharedState` before `accept_loop` starts serving, rather than
+    // leaving new clients to see a misleading `SilentNoDevice` until
+    // the engine's own health computation eventually catches up (which
+    // it never fully will here: `compute_health`'s own `Broken` path
+    // only fires on "capture node not present," a narrower check than
+    // "filter-chain.service itself failed to start").
+    if let Some(reason) = &startup_broken_reason {
+        initial_state.health = engine::HealthStatus::Broken { reason: reason.clone() };
+    }
+    let shared = Arc::new(Mutex::new(initial_state));
     let broadcaster = Broadcaster::new();
+    let session_registry = SessionRegistry::new();
     let session_cmd_tx = session.command_sender();
     {
         let shared = shared.clone();
         let broadcaster = broadcaster.clone();
-        std::thread::spawn(move || accept_loop(listener, shared, broadcaster, session_cmd_tx));
+        let session_registry = session_registry.clone();
+        std::thread::spawn(move || {
+            accept_loop(listener, shared, broadcaster, session_registry, session_cmd_tx)
+        });
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -183,7 +197,7 @@ fn cmd_run() {
                         let _ = engine::write_atomic(&config_path, &content);
                     }
                 }
-                handle_session_event(&shared, &broadcaster, event);
+                handle_session_event(&shared, &broadcaster, &session_registry, event);
             }
             None => std::thread::sleep(Duration::from_millis(100)),
         }
@@ -254,19 +268,36 @@ fn update_known_devices(
 /// inspected and repaired if missing — a user deleting it while the
 /// unit is stopped is exactly the R7 "artifacts missing" case, and
 /// starting `filter-chain.service` against a nonexistent conf.d entry
-/// would silently produce no source at all. Regeneration (either here
-/// or in the `RegenerateAndRestart` branch below, which covers the
-/// unit-still-active-but-fragment-corrupted case) writes the fragment
-/// from the daemon's *persisted* config (falling back to
+/// would silently produce no source at all. Regeneration (here, or in
+/// either branch of the `match` below) writes the fragment from the
+/// daemon's *persisted* config (falling back to
 /// `FragmentConfig::default()` if the config itself is unreadable —
 /// U3's bypass graph must still come up even when U5's config is
-/// corrupt) and retries the unit start exactly once, never looping.
-fn reconcile_startup() {
+/// corrupt) and retries the unit start exactly once, never looping —
+/// this applies whether the first attempt was `StartFilterChain` (cold
+/// start; the fragment can still hold corrupt *content* even though it
+/// exists) or `RegenerateAndRestart` (unit already active, source
+/// missing).
+///
+/// **Returns `Some(reason)` when repair genuinely failed** (U9: the
+/// source still hasn't appeared after a fragment regenerate + one
+/// restart) — the caller surfaces this into `SharedState.health` as
+/// `Broken` *before* the IPC server starts accepting connections, so
+/// the very first `Snapshot` any client receives already carries the
+/// honest verdict (R5/R7), rather than a client seeing a misleadingly
+/// blank `SilentNoDevice` while the daemon is silently already in a
+/// known-broken state. `reason` includes the tail of `journalctl` for
+/// `filter-chain.service` — precise enough to act on directly, per R7's
+/// "say precisely what is wrong."  Returns `None` on `Adopt` or a
+/// successful repair — the daemon proceeds to host the engine exactly
+/// as before; a failure here is never retried in a loop, only reported.
+fn reconcile_startup() -> Option<String> {
     let paths = match InstallPaths::production() {
         Ok(p) => p,
         Err(e) => {
-            tracing::error!("could not resolve install paths for startup reconciliation: {e}");
-            return;
+            let reason = format!("could not resolve install paths for startup reconciliation: {e}");
+            tracing::error!("{reason}");
+            return Some(reason);
         }
     };
 
@@ -281,8 +312,9 @@ fn reconcile_startup() {
         );
         let content = engine::render_fragment(&fragment_config);
         if let Err(e) = engine::write_atomic(&paths.fragment_path, &content) {
-            tracing::error!("failed to regenerate missing fragment: {e}");
-            return;
+            let reason = format!("failed to regenerate missing fragment: {e}");
+            tracing::error!("{reason}");
+            return Some(reason);
         }
     }
 
@@ -293,10 +325,35 @@ fn reconcile_startup() {
     match action {
         StartupAction::Adopt => {
             tracing::info!("startup: adopting existing source, no action needed");
+            None
         }
         StartupAction::StartFilterChain => {
             tracing::info!("startup: starting {FILTER_CHAIN_UNIT} (cold start)");
-            start_filter_chain_and_wait();
+            match start_filter_chain_and_wait() {
+                None => None,
+                Some(first_failure) => {
+                    // The fragment file existed (checked above) but its
+                    // *contents* may be garbage (hand-edited or
+                    // corrupted while the unit was stopped) -- the same
+                    // repair this daemon applies when
+                    // `RegenerateAndRestart` finds a live-but-empty
+                    // unit. Regenerate from config and retry exactly
+                    // once; never loop past this single retry (R7).
+                    tracing::warn!(
+                        "startup: cold start of {FILTER_CHAIN_UNIT} failed ({first_failure}); \
+                         regenerating fragment from config and retrying once"
+                    );
+                    let content = engine::render_fragment(&fragment_config);
+                    if let Err(e) = engine::write_atomic(&paths.fragment_path, &content) {
+                        let reason = format!(
+                            "failed to regenerate fragment after cold-start failure: {e}"
+                        );
+                        tracing::error!("{reason}");
+                        return Some(reason);
+                    }
+                    restart_filter_chain_and_wait()
+                }
+            }
         }
         StartupAction::RegenerateAndRestart => {
             tracing::warn!(
@@ -305,10 +362,11 @@ fn reconcile_startup() {
             );
             let content = engine::render_fragment(&fragment_config);
             if let Err(e) = engine::write_atomic(&paths.fragment_path, &content) {
-                tracing::error!("failed to regenerate fragment: {e}");
-                return;
+                let reason = format!("failed to regenerate fragment: {e}");
+                tracing::error!("{reason}");
+                return Some(reason);
             }
-            restart_filter_chain_and_wait();
+            restart_filter_chain_and_wait()
         }
     }
 }
@@ -330,38 +388,97 @@ fn source_node_present(source_name: &str) -> bool {
     }
 }
 
-fn start_filter_chain_and_wait() {
+/// The tail of `journalctl --user -u <unit>` — attached to a `Broken`
+/// reason so R7's "say precisely what is wrong" points at the actual
+/// systemd/PipeWire error, not just "it didn't start." Best-effort: a
+/// `journalctl` failure (missing binary, no journal access) degrades to
+/// a short placeholder rather than losing the `Broken` report entirely.
+fn recent_unit_journal(unit: &str, lines: u32) -> String {
+    std::process::Command::new("journalctl")
+        .args(["--user", "-u", unit, "-n", &lines.to_string(), "--no-pager"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(journal unavailable)".to_string())
+}
+
+/// Starts `filter-chain.service` and waits for the source to appear.
+/// Returns `Some(reason)` on failure -- covers both a `systemctl start`
+/// that itself fails and one that succeeds but the source never shows
+/// up within the timeout (a plausible corrupt-fragment case even on a
+/// cold start, not just the `RegenerateAndRestart` branch).
+fn start_filter_chain_and_wait() -> Option<String> {
     let status = std::process::Command::new("systemctl")
         .args(["--user", "start", FILTER_CHAIN_UNIT])
         .status();
     match status {
-        Ok(s) if s.success() => wait_for_source(engine::SOURCE_NAME, Duration::from_secs(10)),
-        Ok(s) => tracing::error!("systemctl start {FILTER_CHAIN_UNIT} exited with {s}"),
-        Err(e) => tracing::error!("failed to run systemctl start {FILTER_CHAIN_UNIT}: {e}"),
+        Ok(s) if s.success() => {
+            if wait_for_source_bool(engine::SOURCE_NAME, Duration::from_secs(10)) {
+                None
+            } else {
+                let reason = format!(
+                    "filter-chain failed to start: source did not appear within 10s. \
+                     journal:\n{}",
+                    recent_unit_journal(FILTER_CHAIN_UNIT, 20)
+                );
+                tracing::error!("{reason}");
+                Some(reason)
+            }
+        }
+        Ok(s) => {
+            let reason = format!(
+                "systemctl start {FILTER_CHAIN_UNIT} exited with {s}. journal:\n{}",
+                recent_unit_journal(FILTER_CHAIN_UNIT, 20)
+            );
+            tracing::error!("{reason}");
+            Some(reason)
+        }
+        Err(e) => {
+            let reason = format!("failed to run systemctl start {FILTER_CHAIN_UNIT}: {e}");
+            tracing::error!("{reason}");
+            Some(reason)
+        }
     }
 }
 
-fn restart_filter_chain_and_wait() {
+/// Restarts `filter-chain.service` (the `RegenerateAndRestart` branch's
+/// retry-once) and waits for the source to reappear. Returns
+/// `Some(reason)` — with the unit's own journal tail — if the source
+/// still hasn't shown up after this one retry; the caller never loops
+/// past this single attempt (R7: "never loop start attempts").
+fn restart_filter_chain_and_wait() -> Option<String> {
     let status = std::process::Command::new("systemctl")
         .args(["--user", "restart", FILTER_CHAIN_UNIT])
         .status();
     match status {
         Ok(s) if s.success() => {
-            if !wait_for_source_bool(engine::SOURCE_NAME, Duration::from_secs(10)) {
-                tracing::error!(
+            if wait_for_source_bool(engine::SOURCE_NAME, Duration::from_secs(10)) {
+                None
+            } else {
+                let reason = format!(
                     "filter-chain failed to start: source did not appear after regenerating \
-                     the fragment and restarting once"
+                     the fragment and restarting once. journal:\n{}",
+                    recent_unit_journal(FILTER_CHAIN_UNIT, 20)
                 );
+                tracing::error!("{reason}");
+                Some(reason)
             }
         }
-        Ok(s) => tracing::error!("systemctl restart {FILTER_CHAIN_UNIT} exited with {s}"),
-        Err(e) => tracing::error!("failed to run systemctl restart {FILTER_CHAIN_UNIT}: {e}"),
-    }
-}
-
-fn wait_for_source(name: &str, timeout: Duration) {
-    if !wait_for_source_bool(name, timeout) {
-        tracing::error!("source '{name}' did not appear within {timeout:?} of starting the unit");
+        Ok(s) => {
+            let reason = format!(
+                "systemctl restart {FILTER_CHAIN_UNIT} exited with {s}. journal:\n{}",
+                recent_unit_journal(FILTER_CHAIN_UNIT, 20)
+            );
+            tracing::error!("{reason}");
+            Some(reason)
+        }
+        Err(e) => {
+            let reason = format!("failed to run systemctl restart {FILTER_CHAIN_UNIT}: {e}");
+            tracing::error!("{reason}");
+            Some(reason)
+        }
     }
 }
 
@@ -375,6 +492,7 @@ fn wait_for_source_bool(name: &str, timeout: Duration) -> bool {
     }
     false
 }
+
 
 #[cfg(test)]
 mod tests {
