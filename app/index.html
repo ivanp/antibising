@@ -152,6 +152,39 @@
         border-radius: 3px;
       }
 
+      /* Dual comparison meters (Raw vs Filtered) above the threshold
+         slider, for tuning the denoise strength. */
+      #dual-meter {
+        margin: 4px 0 10px;
+      }
+      .meter-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 6px;
+      }
+      .meter-row > label {
+        margin: 0;
+        flex-shrink: 0;
+        width: 52px;
+        font-size: 0.8em;
+        color: var(--fg-muted, #999);
+      }
+      .meter-bar {
+        flex: 1;
+        height: 6px;
+        border-radius: 3px;
+        background: var(--bg-input);
+        overflow: hidden;
+      }
+      .meter-bar > div {
+        height: 100%;
+        width: 0%;
+        background: var(--green);
+        transition: width 60ms linear;
+        border-radius: 3px;
+      }
+
       #monitor-warning {
         font-size: 0.85em;
         color: var(--yellow);
@@ -189,6 +222,16 @@
             <label for="denoise-toggle" style="margin:0">Denoise</label>
             <button id="denoise-toggle">Off</button>
           </div>
+          <div id="dual-meter">
+            <div class="meter-row">
+              <label>Raw</label>
+              <div class="meter-bar"><div id="raw-meter-bar"></div></div>
+            </div>
+            <div class="meter-row">
+              <label>Filtered</label>
+              <div class="meter-bar"><div id="filtered-meter-bar"></div></div>
+            </div>
+          </div>
           <div class="row" style="margin-top:10px">
             <label for="threshold-slider" style="margin:0;flex-shrink:0">Strength</label>
             <input type="range" id="threshold-slider" min="0" max="99" step="1" value="50" />
@@ -219,6 +262,8 @@
       const monitorButton = document.querySelector('#monitor-button');
       const monitorWarning = document.querySelector('#monitor-warning');
       const speechMeterBar = document.querySelector('#speech-meter-bar');
+      const rawMeterBar = document.querySelector('#raw-meter-bar');
+      const filteredMeterBar = document.querySelector('#filtered-meter-bar');
 
       // Panel-local mirror of daemon-verified state (R5: never assert
       // anything the daemon hasn't confirmed). `pin` is the persisted
@@ -325,8 +370,17 @@
             monitorWarning.style.display = 'none';
             break;
           case 'meter_frame': {
+            // Post-denoise level (KTD1/KTD4). Drives the existing
+            // "Hear yourself" speech meter and the "Filtered" comparison bar.
             const pct = Math.min(100, Math.round(payload.rms * 200));
             speechMeterBar.style.width = pct + '%';
+            filteredMeterBar.style.width = pct + '%';
+            break;
+          }
+          case 'raw_meter_frame': {
+            // Pre-denoise (raw device) level (KTD4). Drives the "Raw" bar.
+            const pct = Math.min(100, Math.round(payload.rms * 200));
+            rawMeterBar.style.width = pct + '%';
             break;
           }
           case 'error':
@@ -386,6 +440,21 @@
           console.error('pull_state failed', e);
         }
         invoke('request_snapshot').catch((e) => console.error('request_snapshot failed', e));
+        // Subscribe to both meters so the dual comparison animates whenever
+        // the panel is open (U5/R6). The tray keeps the post meter always-on,
+        // but the panel takes its own leases so the raw meter runs too.
+        invoke('start_meter').catch((e) => console.error('start_meter failed', e));
+        invoke('start_raw_meter').catch((e) => console.error('start_raw_meter failed', e));
+      });
+
+      // Release both meter leases when the panel closes or reloads, so the
+      // refcount returns to its baseline. Without this, every webview reload
+      // increments the leases permanently and the raw capture would survive
+      // after the panel is gone (the post meter's tray baseline keeps it at
+      // >=1, but the raw meter would leak).
+      window.addEventListener('beforeunload', () => {
+        invoke('stop_meter').catch(() => {});
+        invoke('stop_raw_meter').catch(() => {});
       });
     </script>
   </body>
