@@ -22,6 +22,58 @@ use ksni::{Tray, TrayMethods};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
+
+#[allow(dead_code)]
+const MIC_SIZE: i32 = 22;
+
+#[allow(dead_code)]
+const TRANSPARENT: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+#[allow(dead_code)]
+const WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+#[allow(dead_code)]
+const GREEN: [u8; 4] = [0xFF, 0x00, 0xCC, 0x44];
+
+#[allow(dead_code)]
+fn is_mic_shape(x: i32, y: i32) -> bool {
+    // Top cap (semicircle approximation)
+    if y == 2 && (9..=13).contains(&x) { return true; }
+    if y == 3 && (8..=14).contains(&x) { return true; }
+    // Body
+    if (4..=12).contains(&y) && (8..=14).contains(&x) { return true; }
+    // Bottom of body (rounded)
+    if y == 13 && (9..=13).contains(&x) { return true; }
+    // Cradle arc
+    if y == 14 && ((7..=8).contains(&x) || (14..=15).contains(&x)) { return true; }
+    if y == 15 && (x == 7 || x == 15) { return true; }
+    if y == 16 && (8..=14).contains(&x) && !(9..=13).contains(&x) { return true; }
+    // Stem
+    if (16..=17).contains(&y) && (10..=12).contains(&x) { return true; }
+    // Base
+    if y == 18 && (8..=14).contains(&x) { return true; }
+    false
+}
+
+#[allow(dead_code)]
+fn render_icon(level: f32) -> Vec<u8> {
+    let size = MIC_SIZE;
+    let mut buf = vec![0u8; (size * size * 4) as usize];
+    let clamped = level.clamp(0.0, 1.0);
+    // fill_row: row at-and-below which shape pixels are green.
+    // level 0.0 → fill_row = size (nothing filled)
+    // level 1.0 → fill_row = 0 (everything filled)
+    let fill_row = size - (clamped * size as f32) as i32;
+    for y in 0..size {
+        for x in 0..size {
+            if is_mic_shape(x, y) {
+                let offset = ((y * size + x) * 4) as usize;
+                let color = if y >= fill_row { GREEN } else { WHITE };
+                buf[offset..offset + 4].copy_from_slice(&color);
+            }
+        }
+    }
+    buf
+}
+
 /// The ksni tray. Holds an `AppHandle` (Send+Sync, per
 /// `docs/ksni-tauri-coexistence.md` §4) to show/focus the panel window
 /// from `activate()`, and the shared `Bridge` to read current state for
@@ -233,4 +285,74 @@ pub fn spawn(app: AppHandle, bridge: Arc<Bridge>) {
             eprintln!("tray: failed to start ksni service: {e}");
         }
     });
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_icon_output_size() {
+        let buf = render_icon(0.0);
+        assert_eq!(buf.len(), (MIC_SIZE * MIC_SIZE * 4) as usize);
+    }
+
+    #[test]
+    fn render_icon_zero_has_no_green() {
+        let buf = render_icon(0.0);
+        for y in 0..MIC_SIZE {
+            for x in 0..MIC_SIZE {
+                let off = ((y * MIC_SIZE + x) * 4) as usize;
+                let pixel = &buf[off..off + 4];
+                assert_ne!(pixel, &GREEN, "green pixel found at ({x}, {y}) with level 0.0");
+            }
+        }
+    }
+
+    #[test]
+    fn render_icon_full_has_no_white_shape_pixels() {
+        let buf = render_icon(1.0);
+        for y in 0..MIC_SIZE {
+            for x in 0..MIC_SIZE {
+                if is_mic_shape(x, y) {
+                    let off = ((y * MIC_SIZE + x) * 4) as usize;
+                    let pixel = &buf[off..off + 4];
+                    assert_ne!(pixel, &WHITE, "white shape pixel at ({x}, {y}) with level 1.0");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_icon_half_has_both_colors() {
+        let buf = render_icon(0.5);
+        let mut has_green = false;
+        let mut has_white = false;
+        for y in 0..MIC_SIZE {
+            for x in 0..MIC_SIZE {
+                if is_mic_shape(x, y) {
+                    let off = ((y * MIC_SIZE + x) * 4) as usize;
+                    let pixel = &buf[off..off + 4];
+                    if pixel == &GREEN { has_green = true; }
+                    if pixel == &WHITE { has_white = true; }
+                }
+            }
+        }
+        assert!(has_green, "no green pixels at level 0.5");
+        assert!(has_white, "no white pixels at level 0.5");
+    }
+
+    #[test]
+    fn render_icon_non_shape_pixels_transparent() {
+        let buf = render_icon(0.5);
+        for y in 0..MIC_SIZE {
+            for x in 0..MIC_SIZE {
+                if !is_mic_shape(x, y) {
+                    let off = ((y * MIC_SIZE + x) * 4) as usize;
+                    assert_eq!(buf[off], 0x00, "non-shape pixel at ({x}, {y}) has non-zero alpha");
+                }
+            }
+        }
+    }
 }
