@@ -53,15 +53,28 @@ fn render_icon(level: f32) -> Vec<u8> {
     let size = MIC_SIZE;
     let mut buf = vec![0u8; (size * size * 4) as usize];
     let clamped = level.clamp(0.0, 1.0);
-    // fill_row: row at-and-below which shape pixels are green.
-    // level 0.0 → fill_row = size (nothing filled)
-    // level 1.0 → fill_row = 0 (everything filled)
-    let fill_row = size - (clamped * size as f32) as i32;
+
+    // The mic body (the fillable region) spans rows BODY_TOP..=BODY_BOTTOM.
+    // Cradle, stem, and base (rows 14–18) are structural and stay white.
+    const BODY_TOP: i32 = 2;
+    const BODY_BOTTOM: i32 = 13;
+    const BODY_HEIGHT: i32 = BODY_BOTTOM - BODY_TOP + 1; // 12 rows
+
+    // fill_row: rows at-and-below this get green (within the body).
+    // level 0.0 → fill_row = BODY_BOTTOM + 1 (nothing filled)
+    // level 1.0 → fill_row = BODY_TOP (everything filled)
+    let fill_row = BODY_BOTTOM + 1 - (clamped * BODY_HEIGHT as f32) as i32;
+
     for y in 0..size {
         for x in 0..size {
             if is_mic_shape(x, y) {
                 let offset = ((y * size + x) * 4) as usize;
-                let color = if y >= fill_row { GREEN } else { WHITE };
+                // Green fill only in the body region (rows 2–13).
+                let color = if y >= fill_row && y <= BODY_BOTTOM {
+                    GREEN
+                } else {
+                    WHITE
+                };
                 buf[offset..offset + 4].copy_from_slice(&color);
             }
         }
@@ -310,7 +323,10 @@ pub fn spawn(app: AppHandle, bridge: Arc<Bridge>) {
 
     tauri::async_runtime::spawn(async move {
         // Subscribe to the meter stream — always-on (R2, KD2).
-        let _ = bridge.acquire_meter();
+        match bridge.acquire_meter() {
+            Ok(()) => eprintln!("tray: acquire_meter succeeded"),
+            Err(e) => eprintln!("tray: acquire_meter FAILED: {e}"),
+        }
 
         let tray = AntibisingTray {
             app,
@@ -333,10 +349,16 @@ pub fn spawn(app: AppHandle, bridge: Arc<Bridge>) {
             handle
                 .update(|tray: &mut AntibisingTray| {
                     // Read the latest meter frame from Bridge's cache.
-                    if let Some(frame) = tray.bridge.last_meter() {
-                        // Scale RMS to 0.0–1.0 using the same ×2
-                        // calibration as the panel UI (rms * 200 in JS).
-                        let level = f32::min(1.0, frame.rms * 2.0);
+                    let meter = tray.bridge.last_meter();
+                    if let Some(frame) = meter {
+                        // Map RMS to 0.0–1.0 display level. Post-denoise
+                        // speech at desk distance produces RMS ~0.01–0.05;
+                        // a linear ×2 scale leaves that invisible. Use a
+                        // power curve: sqrt(rms / reference) where reference
+                        // 0.05 = "normal speech ≈ full". The sqrt compresses
+                        // dynamic range so quiet speech is still visible.
+                        let reference = 0.05_f32;
+                        let level = f32::min(1.0, (frame.rms / reference).sqrt());
                         // Fast rise, slow decay.
                         tray.smoothed_level =
                             f32::max(level, tray.smoothed_level * DECAY_FACTOR);
@@ -382,14 +404,20 @@ mod tests {
     }
 
     #[test]
-    fn render_icon_full_has_no_white_shape_pixels() {
+    fn render_icon_full_body_is_all_green() {
         let buf = render_icon(1.0);
+        // Body pixels (rows 2–13) should all be green at level 1.0.
+        // Structural pixels (cradle/stem/base, rows 14–18) stay white.
         for y in 0..MIC_SIZE {
             for x in 0..MIC_SIZE {
                 if is_mic_shape(x, y) {
                     let off = ((y * MIC_SIZE + x) * 4) as usize;
                     let pixel = &buf[off..off + 4];
-                    assert_ne!(pixel, &WHITE, "white shape pixel at ({x}, {y}) with level 1.0");
+                    if y <= 13 {
+                        assert_eq!(pixel, &GREEN, "body pixel at ({x}, {y}) should be green at level 1.0");
+                    } else {
+                        assert_eq!(pixel, &WHITE, "structural pixel at ({x}, {y}) should be white at level 1.0");
+                    }
                 }
             }
         }
