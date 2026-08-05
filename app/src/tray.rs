@@ -20,20 +20,16 @@ use engine::HealthStatus;
 use ksni::menu::{CheckmarkItem, MenuItem, StandardItem};
 use ksni::{Tray, TrayMethods};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
 
-#[allow(dead_code)]
 const MIC_SIZE: i32 = 22;
 
-#[allow(dead_code)]
-const TRANSPARENT: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
-#[allow(dead_code)]
 const WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
-#[allow(dead_code)]
 const GREEN: [u8; 4] = [0xFF, 0x00, 0xCC, 0x44];
 
-#[allow(dead_code)]
 fn is_mic_shape(x: i32, y: i32) -> bool {
     // Top cap (semicircle approximation)
     if y == 2 && (9..=13).contains(&x) { return true; }
@@ -53,7 +49,6 @@ fn is_mic_shape(x: i32, y: i32) -> bool {
     false
 }
 
-#[allow(dead_code)]
 fn render_icon(level: f32) -> Vec<u8> {
     let size = MIC_SIZE;
     let mut buf = vec![0u8; (size * size * 4) as usize];
@@ -77,12 +72,21 @@ fn render_icon(level: f32) -> Vec<u8> {
 /// The ksni tray. Holds an `AppHandle` (Send+Sync, per
 /// `docs/ksni-tauri-coexistence.md` §4) to show/focus the panel window
 /// from `activate()`, and the shared `Bridge` to read current state for
-/// `icon_name()`/`menu()` and to send `set_pin`/`toggle_denoise`
-/// commands from menu actions — the same bridge the webview's commands
-/// use, so pinning from the tray menu is not a second code path.
+/// `icon_name()`/`icon_pixmap()`/`menu()` and to send `set_pin`/
+/// `toggle_denoise` commands from menu actions — the same bridge the
+/// webview's commands use, so pinning from the tray menu is not a
+/// second code path.
 pub struct AntibisingTray {
     app: AppHandle,
     bridge: Arc<Bridge>,
+    /// Smoothed audio level (0.0–1.0) for the tray icon's green fill.
+    smoothed_level: f32,
+    /// Monotonically increasing counter bumped on watcher_online to
+    /// force a tooltip change so ksni re-announces after a waybar restart.
+    refresh_seq: u32,
+    /// Set by watcher_online (synchronous, &self only), consumed by the
+    /// update loop's next tick to bump refresh_seq.
+    force_icon_refresh: Arc<AtomicBool>,
 }
 
 impl Tray for AntibisingTray {
@@ -94,14 +98,14 @@ impl Tray for AntibisingTray {
         "antibising".into()
     }
 
-    /// Health-derived icon (R5: icon honesty — it reflects the daemon's
-    /// own verdict, never an assumption). Falls back to the muted/silent
-    /// icon when the bridge has no snapshot yet (daemon unreachable or
-    /// still connecting) — an honest "nothing confirmed" state, not a
-    /// false "healthy" default.
+    /// Health-derived icon name. When Linked, returns an empty string so
+    /// waybar falls through to `icon_pixmap()` (KTD4 — waybar resolves
+    /// IconName first; a valid theme name would prevent the pixmap from
+    /// ever being consulted). Non-Linked states return their themed
+    /// icons as before.
     fn icon_name(&self) -> String {
         match self.bridge.last_health() {
-            Some(HealthStatus::Linked { .. }) => "microphone-sensitivity-high-symbolic".into(),
+            Some(HealthStatus::Linked { .. }) => String::new(),
             Some(HealthStatus::Broken { .. }) => "dialog-warning-symbolic".into(),
             Some(HealthStatus::Reconnecting) => "view-refresh-symbolic".into(),
             Some(HealthStatus::SilentNoDevice) | None => {
@@ -110,14 +114,37 @@ impl Tray for AntibisingTray {
         }
     }
 
+    /// Custom pixmap for the level meter (KTD4). When Linked, returns
+    /// the microphone silhouette with green fill proportional to
+    /// `smoothed_level`. Non-Linked states return an empty vec so
+    /// waybar uses `icon_name()` instead.
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        if matches!(self.bridge.last_health(), Some(HealthStatus::Linked { .. })) {
+            vec![ksni::Icon {
+                width: MIC_SIZE,
+                height: MIC_SIZE,
+                data: render_icon(self.smoothed_level),
+            }]
+        } else {
+            vec![]
+        }
+    }
+
     fn tool_tip(&self) -> ksni::ToolTip {
-        let description = match self.bridge.last_health() {
+        let mut description = match self.bridge.last_health() {
             Some(HealthStatus::Linked { description, .. }) => description,
             Some(HealthStatus::Broken { reason }) => format!("Broken: {reason}"),
             Some(HealthStatus::Reconnecting) => "Reconnecting…".to_string(),
             Some(HealthStatus::SilentNoDevice) => "No microphone".to_string(),
             None => "Daemon unreachable".to_string(),
         };
+        // Append an invisible revision tag so a watcher_online bump
+        // changes the tooltip hash even when the text is unchanged —
+        // ksni only emits NewToolTip when the hash differs.
+        if self.refresh_seq > 0 {
+            use std::fmt::Write;
+            let _ = write!(description, " (r{})", self.refresh_seq);
+        }
         ksni::ToolTip {
             title: "antibising".into(),
             description,
@@ -240,14 +267,15 @@ impl Tray for AntibisingTray {
     /// from the tray's very first (pre-connect) registration.
     fn menu_about_to_show(&mut self) {}
 
-    /// Bar/watcher restart survival (U8's own test scenario): ksni
-    /// re-registers the item automatically on `watcher_online` (the
-    /// zbus connection itself survives a bar restart); no extra work
-    /// is needed here since `icon_name`/`tool_tip` are read live on
-    /// every property fetch and `menu_about_to_show` above already
-    /// refreshes the menu on the newly-restarted bar's very first
-    /// click.
-    fn watcher_online(&self) {}
+    /// Bar/watcher restart: set the force-refresh flag so the update
+    /// loop's next tick bumps `refresh_seq`, changing the tooltip hash
+    /// and forcing ksni to re-announce all properties (including
+    /// IconPixmap) to the restarted host. Without this, a steady-state
+    /// pixmap (silence, sustained noise) produces an empty diff and
+    /// waybar stays blank after restart.
+    fn watcher_online(&self) {
+        self.force_icon_refresh.store(true, Ordering::Relaxed);
+    }
 }
 
 fn quit_item() -> MenuItem<AntibisingTray> {
@@ -262,27 +290,70 @@ fn quit_item() -> MenuItem<AntibisingTray> {
     .into()
 }
 
-/// Spawn the tray on Tauri's own tokio runtime (`tauri::async_runtime`,
-/// not a bare `tokio::spawn` -- keeps the tray on the same executor
-/// Tauri already manages, per the plan's own decision to use ksni's
-/// default `tokio` feature).
+/// Spawn the tray on Tauri's own tokio runtime and enter a ~15 Hz
+/// update loop that reads the Bridge meter cache, applies fast-rise /
+/// slow-decay smoothing, and pushes pixmap updates via the retained
+/// ksni `Handle`.
 ///
-/// The `Handle` returned by `TrayMethods::spawn` is intentionally
-/// dropped here: it only holds a `Weak` reference into the tray
-/// service plus an update-channel sender (verified in ksni's own
-/// `service::run` -- the D-Bus event loop itself is spawned as an
-/// independent task holding the real `Arc`), so dropping it forfeits
-/// only the ability to explicitly push an update — it does NOT stop
-/// the running tray. No explicit push is needed: `icon_name`/
-/// `tool_tip` are read live on every property fetch, and `menu()` is
-/// refreshed via `menu_about_to_show`'s override just before the host
-/// displays it (see that method's doc comment for why the override is
-/// required at all).
+/// The `Handle` is now retained (previously dropped) so
+/// `handle.update()` can signal property changes to waybar. Each tick
+/// reads the smoothed level and calls `handle.update()`, which diffs
+/// properties and emits `NewIcon` only when the pixmap actually
+/// changed.
 pub fn spawn(app: AppHandle, bridge: Arc<Bridge>) {
+    // Decay factor per tick at ~15 Hz: half-life ~266ms, zero-out ~1.9s.
+    const DECAY_FACTOR: f32 = 0.85;
+    const LEVEL_FLOOR: f32 = 0.01;
+    const UPDATE_INTERVAL: Duration = Duration::from_millis(66);
+
+    let force_flag = Arc::new(AtomicBool::new(false));
+
     tauri::async_runtime::spawn(async move {
-        let tray = AntibisingTray { app, bridge };
-        if let Err(e) = tray.spawn().await {
-            eprintln!("tray: failed to start ksni service: {e}");
+        // Subscribe to the meter stream — always-on (R2, KD2).
+        let _ = bridge.acquire_meter();
+
+        let tray = AntibisingTray {
+            app,
+            bridge,
+            smoothed_level: 0.0,
+            refresh_seq: 0,
+            force_icon_refresh: force_flag,
+        };
+        let handle = match tray.spawn().await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("tray: failed to start ksni service: {e}");
+                return;
+            }
+        };
+
+        let mut interval = tokio::time::interval(UPDATE_INTERVAL);
+        loop {
+            interval.tick().await;
+            handle
+                .update(|tray: &mut AntibisingTray| {
+                    // Read the latest meter frame from Bridge's cache.
+                    if let Some(frame) = tray.bridge.last_meter() {
+                        // Scale RMS to 0.0–1.0 using the same ×2
+                        // calibration as the panel UI (rms * 200 in JS).
+                        let level = f32::min(1.0, frame.rms * 2.0);
+                        // Fast rise, slow decay.
+                        tray.smoothed_level =
+                            f32::max(level, tray.smoothed_level * DECAY_FACTOR);
+                    } else {
+                        // No data — decay only.
+                        tray.smoothed_level *= DECAY_FACTOR;
+                    }
+                    // Clamp to zero below the floor to avoid rendering noise.
+                    if tray.smoothed_level < LEVEL_FLOOR {
+                        tray.smoothed_level = 0.0;
+                    }
+                    // Force-refresh after a watcher_online event.
+                    if tray.force_icon_refresh.swap(false, Ordering::Relaxed) {
+                        tray.refresh_seq = tray.refresh_seq.wrapping_add(1);
+                    }
+                })
+                .await;
         }
     });
 }
