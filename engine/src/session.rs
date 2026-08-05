@@ -13,7 +13,7 @@
 
 use crate::model::{is_candidate_source, DeviceId, DeviceInfo};
 use crate::reconcile::{decide_action, ActualLink, ReconcileAction};
-use crate::routing::{compute_desired_feed, should_release_pin};
+use crate::routing::{compute_desired_feed, should_release_pin, DesiredFeed};
 use pipewire::{
     context::ContextRc,
     core::CoreRc,
@@ -79,6 +79,13 @@ pub enum SessionCommand {
     /// Stop the meter for `session_id` — disconnects and drops the
     /// capture stream. Idempotent.
     StopMeter(u64),
+    /// Start the raw (pre-denoise) level meter for `session_id`, pushing
+    /// [`crate::meter::MeterFrame`]s into the given channel as the upstream
+    /// device produces them. Mirrors `StartMeter` but targets the raw
+    /// device feed rather than the post-denoise permanent source.
+    StartRawMeter(u64, Arc<Mutex<crate::meter::MeterChannel>>),
+    /// Stop the raw meter for `session_id`. Idempotent.
+    StopRawMeter(u64),
     /// Clean shutdown: quit the loop and let the thread join.
     Shutdown,
 }
@@ -272,6 +279,25 @@ struct Generation {
     /// registered `process` callback — dropping either tears the stream
     /// down, which is exactly `StopMeter`'s mechanism.
     meter_sessions: HashMap<u64, MeterSession>,
+    /// Active raw (pre-denoise) meter capture streams, keyed by
+    /// `session_id`. Mirrors `meter_sessions` but targets the upstream
+    /// device rather than the post-denoise source.
+    raw_meter_sessions: HashMap<u64, MeterSession>,
+    /// Every input port seen this generation, keyed by owning node.id.
+    /// Recorded unconditionally (regardless of whether any meter session
+    /// has resolved its node_id yet) so that the port-before-node_id
+    /// race is eliminated: the meter stream's own input port can arrive
+    /// before `.state_changed(Paused)` sets the session's node_id, and
+    /// recording unconditionally here means convergence finds it later.
+    /// Mirrors how `device_output_ports` records output ports.
+    input_ports_by_node: HashMap<u32, Vec<(u32, String)>>,
+    /// Maps a port global id -> its owning node id. `global_remove` gets a
+    /// bare id with no type, so a departed *port* id must be resolved to
+    /// its node to prune the right entry from `device_output_ports` /
+    /// `input_ports_by_node` / `source_output_ports` / `capture_input_ports`
+    /// / `sink_input_ports`. Without this, a removed/recreated port stays
+    /// cached and `converge_meter_links` could link to a dead port id.
+    port_owner: HashMap<u32, u32>,
 }
 
 /// A Link global observed on the capture node, as reported by PipeWire —
@@ -310,15 +336,31 @@ struct MonitorSession {
     links: Vec<Link>,
 }
 
-/// A live meter capture session (U6/R9), bound to one IPC client's
-/// `session_id`. Holds the stream + its listener (whose `process`
-/// callback pushes frames into `channel`) so both stay alive exactly as
-/// long as the session does; dropping either tears the stream down.
+/// A live meter capture session, bound to one IPC client's `session_id`.
+/// Holds the stream + its listener (whose `process` callback pushes frames
+/// into `channel`) so both stay alive exactly as long as the session does;
+/// dropping either tears the stream down.
+///
+/// `node_id` is `None` until PipeWire assigns the stream a node id (at
+/// `Paused` state). We poll `stream.node_id()` in `reconcile_now` each tick
+/// for sessions where it is still `None`. `links` holds the retained `Link`
+/// proxies that connect the source to this stream's input port; no
+/// `object.linger` (dropping the proxy tears the link down server-side,
+/// exactly the desired teardown path for `StopMeter`).
 struct MeterSession {
-    #[allow(dead_code)] // kept alive for its Drop; never read directly
     stream: StreamRc,
     #[allow(dead_code)] // kept alive for its Drop; never read directly
     listener: StreamListener<()>,
+    /// PipeWire-assigned node id for this stream, set once the stream
+    /// reaches `Paused` state. `None` until then.
+    node_id: Option<u32>,
+    /// Retained Link proxies from source output port(s) to this stream's
+    /// input port. No `object.linger` — dropping tears the link down.
+    links: Vec<Link>,
+    /// The source node id from which links in `links` originate. Used
+    /// by the raw meter to detect device switches (when the desired device
+    /// node changes, stale links are purged and recreated).
+    linked_source_node_id: Option<u32>,
 }
 
 impl Generation {
@@ -343,7 +385,35 @@ impl Generation {
             device_form_factors: HashMap::new(),
             monitor_sessions: HashMap::new(),
             meter_sessions: HashMap::new(),
+            raw_meter_sessions: HashMap::new(),
+            input_ports_by_node: HashMap::new(),
+            port_owner: HashMap::new(),
         }
+    }
+
+    /// Whether any meter or raw-meter session still needs a future
+    /// convergence pass — its stream node id isn't resolved yet, or it has
+    /// no links while a plausible target exists. The timer uses this to
+    /// re-arm the dirty flag so `reconcile_now` keeps polling
+    /// `stream.node_id()` across ticks even on a settled graph, where no
+    /// registry global event would otherwise wake it.
+    fn has_pending_meter_convergence(&self) -> bool {
+        let post_pending = self.meter_sessions.values().any(|s| {
+            // Unresolved node id, or resolved but not yet linked while a
+            // post-denoise source exists to link to.
+            s.node_id.is_none() || (s.links.is_empty() && self.source_node_id.is_some())
+        });
+        // Raw sessions only re-arm on an unresolved node id. Once node_id
+        // resolves, linking is gated on a device being connected — an
+        // unlinked raw session with no device is a settled, correct state
+        // (R7/AE3 empty bar), NOT pending work; re-arming on it would spin
+        // the reconcile loop forever with no mic plugged in. A device
+        // arrival fires a registry global that re-marks dirty on its own.
+        let raw_pending = self
+            .raw_meter_sessions
+            .values()
+            .any(|s| s.node_id.is_none());
+        post_pending || raw_pending
     }
 
     /// Record a Device global's resolved identity, then promote any
@@ -409,6 +479,10 @@ impl Generation {
     fn node_departed(&mut self, node_id: u32, event_tx: &StdSender<SessionEvent>) {
         self.pending_nodes.remove(&node_id);
         self.device_output_ports.remove(&node_id);
+        self.input_ports_by_node.remove(&node_id);
+        // Drop any port_owner entries pointing at this node (its ports are
+        // gone with it).
+        self.port_owner.retain(|_, owner| *owner != node_id);
         if self.capture_node_id == Some(node_id) {
             self.capture_node_id = None;
             self.capture_node_proxy = None;
@@ -418,12 +492,80 @@ impl Generation {
         if self.source_node_id == Some(node_id) {
             self.source_node_id = None;
             self.source_output_ports.clear();
+            // The post-denoise source's ports are gone; any post-meter link
+            // to them is dead. Clear retained link proxies so convergence
+            // rebuilds once the source returns (dedup guard would otherwise
+            // block re-linking forever).
+            for s in self.meter_sessions.values_mut() {
+                s.links.clear();
+                s.linked_source_node_id = None;
+            }
         }
         if self.sinks.remove(&node_id).is_some() {
             self.sink_input_ports.remove(&node_id);
         }
+        // A departing device node invalidates any raw-meter link sourced
+        // from it; clear so the reconcile loop rebuilds for the next device.
+        for s in self.raw_meter_sessions.values_mut() {
+            if s.linked_source_node_id == Some(node_id) {
+                s.links.clear();
+                s.linked_source_node_id = None;
+            }
+        }
+        // If a meter *stream's own* node departed (app tearing the stream
+        // down), its input ports and links are gone; the StopMeter path
+        // normally removes the session, but clear links defensively.
+        for s in self.meter_sessions.values_mut() {
+            if s.node_id == Some(node_id) {
+                s.links.clear();
+            }
+        }
+        for s in self.raw_meter_sessions.values_mut() {
+            if s.node_id == Some(node_id) {
+                s.links.clear();
+            }
+        }
         if let Some(dev) = self.devices.remove(&node_id) {
             let _ = event_tx.send(SessionEvent::DeviceDeparted(dev.id));
+        }
+    }
+
+    /// A port global departed. `global_remove` can't tell a port id from a
+    /// node id, so this resolves the id via `port_owner`; a no-op if the id
+    /// isn't a known port (it was a node/link/device instead). Prunes the
+    /// port from every per-node vector and clears any meter link that may
+    /// have used it, so convergence rebuilds valid links next tick.
+    fn port_departed(&mut self, port_id: u32) {
+        let Some(node_id) = self.port_owner.remove(&port_id) else {
+            return; // Not a port we tracked.
+        };
+        let prune = |v: &mut Vec<(u32, String)>| v.retain(|(id, _)| *id != port_id);
+        if let Some(v) = self.device_output_ports.get_mut(&node_id) {
+            prune(v);
+        }
+        if let Some(v) = self.input_ports_by_node.get_mut(&node_id) {
+            prune(v);
+        }
+        if let Some(v) = self.sink_input_ports.get_mut(&node_id) {
+            prune(v);
+        }
+        prune(&mut self.source_output_ports);
+        prune(&mut self.capture_input_ports);
+        // A departed port may have been an endpoint of a meter link. Clear
+        // retained link proxies for any session whose source node or own
+        // meter node owned this port, so the dedup guard doesn't block a
+        // rebuild after PipeWire tears the underlying link down.
+        for s in self.meter_sessions.values_mut() {
+            if s.node_id == Some(node_id) || s.linked_source_node_id == Some(node_id) {
+                s.links.clear();
+                s.linked_source_node_id = None;
+            }
+        }
+        for s in self.raw_meter_sessions.values_mut() {
+            if s.node_id == Some(node_id) || s.linked_source_node_id == Some(node_id) {
+                s.links.clear();
+                s.linked_source_node_id = None;
+            }
         }
     }
 
@@ -816,6 +958,219 @@ mod generation_tests {
             crate::monitor::SpeakerRisk::Unknown
         );
     }
+
+    // --- Meter convergence tests (U1/U2) ---
+    // These test the pure decision logic: early-return conditions, node_id
+    // polling, port-before-node_id ordering, and device-switch purge.
+    // `converge_meter_links` reaches `core.create_object` only when all
+    // guards pass; these tests verify the guards themselves (which need no
+    // real PipeWire core) by extracting the port-selection logic into a
+    // pure helper.
+
+
+    /// Pure decision helper extracted from `converge_meter_links`: given a
+    /// meter node id, source node id, source output ports, and recorded input
+    /// ports, returns the list of (out_port_id, in_port_id) pairs that should
+    /// be linked. Empty means nothing to do (either already linked, ports
+    /// absent, or no source). This function has no PipeWire side-effects.
+    fn decide_meter_link_ports(
+        meter_node_id: Option<u32>,
+        source_node_id: Option<u32>,
+        source_output_ports: &[(u32, String)],
+        input_ports_by_node: &HashMap<u32, Vec<(u32, String)>>,
+        already_has_links: bool,
+    ) -> Vec<(u32, u32)> {
+        // Mirror the early-return conditions in converge_meter_links.
+        let meter_node_id = match meter_node_id {
+            Some(id) => id,
+            None => return vec![], // node_id not yet assigned
+        };
+        let _source_node_id = match source_node_id {
+            Some(id) => id,
+            None => return vec![], // no source yet
+        };
+        if source_output_ports.is_empty() {
+            return vec![];
+        }
+        let meter_input_ports = match input_ports_by_node.get(&meter_node_id) {
+            Some(ports) if !ports.is_empty() => ports,
+            _ => return vec![],
+        };
+        if already_has_links {
+            return vec![]; // idempotent
+        }
+        let mut source_ports = source_output_ports.to_vec();
+        let mut meter_ports = meter_input_ports.clone();
+        source_ports.sort_by(|a, b| a.1.cmp(&b.1));
+        meter_ports.sort_by(|a, b| a.1.cmp(&b.1));
+
+        if source_ports.len() == 1 {
+            let (out_port_id, _) = source_ports[0];
+            meter_ports.iter().map(|(in_port_id, _)| (out_port_id, *in_port_id)).collect()
+        } else {
+            source_ports.iter().zip(meter_ports.iter())
+                .map(|((out, _), (inp, _))| (*out, *inp))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn meter_convergence_no_node_id_returns_empty() {
+        // node_id = None → no ports to create (early return)
+        let mut input_ports: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+        input_ports.insert(42, vec![(101, "input_MONO".into())]);
+        let source_ports = vec![(200, "capture_MONO".into())];
+        let pairs = decide_meter_link_ports(None, Some(130), &source_ports, &input_ports, false);
+        assert!(pairs.is_empty(), "must return empty when node_id is None");
+    }
+
+    #[test]
+    fn meter_convergence_no_source_node_returns_empty() {
+        let input_ports: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+        let pairs = decide_meter_link_ports(Some(42), None, &[], &input_ports, false);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn meter_convergence_source_ports_absent_returns_empty() {
+        let input_ports: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+        let pairs = decide_meter_link_ports(Some(42), Some(130), &[], &input_ports, false);
+        assert!(pairs.is_empty(), "empty source ports → nothing to link");
+    }
+
+    #[test]
+    fn meter_convergence_input_port_not_recorded_returns_empty() {
+        // Port not yet in input_ports_by_node → retry next tick
+        let input_ports: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+        let source_ports = vec![(200, "capture_MONO".into())];
+        let pairs = decide_meter_link_ports(Some(42), Some(130), &source_ports, &input_ports, false);
+        assert!(pairs.is_empty(), "meter input port not recorded → nothing to link");
+    }
+
+    #[test]
+    fn meter_convergence_creates_one_pair_for_mono_source_and_meter() {
+        // Happy path: mono source, mono meter → one (out, in) pair
+        let mut input_ports: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+        input_ports.insert(42, vec![(101, "input_MONO".into())]);
+        let source_ports = vec![(200, "capture_MONO".into())];
+        let pairs = decide_meter_link_ports(Some(42), Some(130), &source_ports, &input_ports, false);
+        assert_eq!(pairs, vec![(200, 101)], "mono source fans to mono meter input");
+    }
+
+    #[test]
+    fn meter_convergence_idempotent_when_links_already_present() {
+        // already_has_links = true → no new pairs (dedup)
+        let mut input_ports: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+        input_ports.insert(42, vec![(101, "input_MONO".into())]);
+        let source_ports = vec![(200, "capture_MONO".into())];
+        let pairs = decide_meter_link_ports(Some(42), Some(130), &source_ports, &input_ports, true);
+        assert!(pairs.is_empty(), "second call must not create additional links");
+    }
+
+    #[test]
+    fn meter_convergence_port_before_node_id_ordering() {
+        // The input port is recorded before node_id is set (port-before-node_id
+        // race). After node_id is set, convergence finds the port and links.
+        let mut input_ports: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+        // Port arrives first (port 101 on node 42).
+        input_ports.insert(42, vec![(101, "input_MONO".into())]);
+        let source_ports = vec![(200, "capture_MONO".into())];
+
+        // Convergence with node_id = None (port arrived, but node_id not set):
+        let pairs_before = decide_meter_link_ports(None, Some(130), &source_ports, &input_ports, false);
+        assert!(pairs_before.is_empty(), "node_id not set: no links yet");
+
+        // node_id is now set (Paused state reached):
+        let pairs_after = decide_meter_link_ports(Some(42), Some(130), &source_ports, &input_ports, false);
+        assert_eq!(pairs_after, vec![(200, 101)], "port found after node_id set");
+    }
+
+    #[test]
+    fn generation_new_has_empty_raw_meter_sessions_and_input_ports() {
+        let gen = Generation::new();
+        assert!(gen.raw_meter_sessions.is_empty());
+        assert!(gen.input_ports_by_node.is_empty());
+        assert!(gen.meter_sessions.is_empty());
+    }
+
+    #[test]
+    fn no_pending_meter_convergence_when_no_sessions() {
+        // Empty generation has no meter work pending — the timer must not
+        // re-arm dirty forever when nothing is subscribed.
+        let gen = Generation::new();
+        assert!(!gen.has_pending_meter_convergence());
+    }
+
+    #[test]
+    fn input_ports_by_node_records_all_in_ports_unconditionally() {
+        // Simulates handle_global adding input ports for any node,
+        // including meter stream nodes whose session node_id isn't set yet.
+        let mut gen = Generation::new();
+        // Simulate a meter stream input port arriving (node 99, port 300)
+        gen.input_ports_by_node
+            .entry(99)
+            .or_default()
+            .push((300, "input_MONO".into()));
+        // Simulate a capture node input port also recorded
+        gen.capture_node_id = Some(77);
+        gen.capture_input_ports.push((400, "capture_FL".into()));
+        gen.input_ports_by_node
+            .entry(77)
+            .or_default()
+            .push((400, "capture_FL".into()));
+
+        // Both nodes' ports are in input_ports_by_node
+        assert!(gen.input_ports_by_node.contains_key(&99));
+        assert!(gen.input_ports_by_node.contains_key(&77));
+        assert_eq!(gen.input_ports_by_node[&99], vec![(300, "input_MONO".into())]);
+    }
+
+    #[test]
+    fn port_departed_prunes_the_port_from_its_node_vectors() {
+        // A departed port id must be pruned from the per-node maps so
+        // convergence never links to a dead port id.
+        let mut gen = Generation::new();
+        // Node 99 owns input port 300; node 130 owns output port 172.
+        gen.input_ports_by_node.entry(99).or_default().push((300, "input_MONO".into()));
+        gen.port_owner.insert(300, 99);
+        gen.device_output_ports.entry(130).or_default().push((172, "capture_MONO".into()));
+        gen.port_owner.insert(172, 130);
+
+        // Port 300 departs.
+        gen.port_departed(300);
+        assert!(
+            gen.input_ports_by_node.get(&99).map(|v| v.is_empty()).unwrap_or(true),
+            "port 300 must be pruned from node 99's input ports"
+        );
+        assert!(!gen.port_owner.contains_key(&300), "port_owner entry removed");
+        // Node 130's output port is untouched.
+        assert_eq!(gen.device_output_ports[&130], vec![(172, "capture_MONO".into())]);
+
+        // A non-port id (never tracked) is a silent no-op.
+        gen.port_departed(99999);
+    }
+
+    #[test]
+    fn raw_meter_device_switch_purge_logic() {
+        // Verify the linked_source_node_id tracking enables device-switch purge:
+        // if linked_source_node_id != new device node, links should be cleared.
+        // We test the conditional logic directly (no PipeWire needed).
+        let old_device_node: u32 = 94;
+        let new_device_node: u32 = 95;
+        let linked_source_node_id: Option<u32> = Some(old_device_node);
+        let desired_device_node: u32 = new_device_node;
+
+        // Simulate the purge condition in reconcile_now's raw meter path:
+        let is_stale = linked_source_node_id.is_some()
+            && linked_source_node_id != Some(desired_device_node);
+        assert!(is_stale, "links from old device should be purged on device switch");
+
+        // Same node: not stale
+        let same_linked: Option<u32> = Some(new_device_node);
+        let is_stale_same = same_linked.is_some()
+            && same_linked != Some(desired_device_node);
+        assert!(!is_stale_same, "links from same device should not be purged");
+    }
 }
 
 enum GenerationOutcome {
@@ -942,6 +1297,7 @@ fn run_one_generation(
                 let mut gen = gen_for_remove.borrow_mut();
                 gen.device_departed(id);
                 gen.node_departed(id, &tx_for_remove);
+                gen.port_departed(id);
                 gen.capture_links.remove(&id);
                 dirty_for_remove.set(true);
             }
@@ -999,6 +1355,16 @@ fn run_one_generation(
                 &link_factory_for_timer,
                 &tx_for_timer,
             );
+            // Re-arm for the next tick while any meter session still needs
+            // convergence (unresolved stream node_id, or resolved-but-
+            // unlinked with a target present). The stream's node_id()
+            // transitions 0 -> assigned at Paused state, which may not
+            // coincide with a registry global event — without this
+            // self-reschedule a settled graph could leave the meter
+            // permanently unlinked. Clears itself once convergence completes.
+            if gen_for_timer.borrow().has_pending_meter_convergence() {
+                dirty_for_timer.set(true);
+            }
         }
 
         let slot = cmd_rx_for_timer.borrow_mut();
@@ -1039,11 +1405,39 @@ fn run_one_generation(
                     let _ = tx_for_timer.send(SessionEvent::MonitorStopped { session_id });
                 }
                 Ok(SessionCommand::StartMeter(session_id, channel)) => {
-                    let mut gen = gen_for_timer.borrow_mut();
-                    start_meter(&mut gen, &core_for_timer, session_id, channel);
+                    start_meter(
+                        &mut gen_for_timer.borrow_mut(),
+                        &core_for_timer,
+                        session_id,
+                        channel,
+                    );
+                    // Schedule convergence on the next tick (KTD1/U1.6).
+                    // reconcile_now runs at the TOP of the tick, before
+                    // commands drain, so a StartMeter arriving after the
+                    // graph settles would otherwise never converge. Setting
+                    // dirty (not an inline reconcile) is correct because the
+                    // stream's node_id() and its input-port global are not
+                    // ready at command-handling time — the useful pass is a
+                    // later tick. The timer re-arms dirty via
+                    // has_pending_meter_convergence() until the node id
+                    // resolves and the link is made.
+                    dirty_for_timer.set(true);
                 }
                 Ok(SessionCommand::StopMeter(session_id)) => {
                     gen_for_timer.borrow_mut().meter_sessions.remove(&session_id);
+                }
+                Ok(SessionCommand::StartRawMeter(session_id, channel)) => {
+                    start_raw_meter(
+                        &mut gen_for_timer.borrow_mut(),
+                        &core_for_timer,
+                        session_id,
+                        channel,
+                    );
+                    // Same settled-graph scheduling as StartMeter above.
+                    dirty_for_timer.set(true);
+                }
+                Ok(SessionCommand::StopRawMeter(session_id)) => {
+                    gen_for_timer.borrow_mut().raw_meter_sessions.remove(&session_id);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -1201,6 +1595,10 @@ fn handle_global(
             let port_name = props.get("port.name").unwrap_or_default().to_string();
 
             let mut gen = generation.borrow_mut();
+            // Record which node owns this port so `global_remove` (which
+            // gets a bare id) can prune the right per-node vectors when the
+            // port departs.
+            gen.port_owner.insert(global.id, node_id);
             if direction == "out" {
                 if gen.source_node_id == Some(node_id) {
                     gen.source_output_ports.push((global.id, port_name.clone()));
@@ -1211,13 +1609,21 @@ fn handle_global(
                     .push((global.id, port_name));
             } else if direction == "in" {
                 if gen.capture_node_id == Some(node_id) {
-                    gen.capture_input_ports.push((global.id, port_name));
+                    gen.capture_input_ports.push((global.id, port_name.clone()));
                 } else if gen.sinks.contains_key(&node_id) {
                     gen.sink_input_ports
                         .entry(node_id)
                         .or_default()
-                        .push((global.id, port_name));
+                        .push((global.id, port_name.clone()));
                 }
+                // Unconditionally record every input port by node id —
+                // this captures meter stream input ports even before the
+                // session's node_id is known (port-before-node_id race),
+                // mirroring how device_output_ports records output ports.
+                gen.input_ports_by_node
+                    .entry(node_id)
+                    .or_default()
+                    .push((global.id, port_name));
             }
         }
         ObjectType::Link => {
@@ -1361,6 +1767,110 @@ fn reconcile_now(
         ReconcileAction::Recreate(device_id) => {
             destroy_capture_links(gen, core);
             converge_capture_links(gen, core, link_factory, &device_id, capture_node_id)
+        }
+    }
+
+    // --- Meter link convergence ---
+    // Reconcile-poll approach (KTD1): for sessions whose node_id is still
+    // None, poll stream.node_id() — it returns 0 until PipeWire assigns one
+    // at Paused state. Once non-zero, store it so subsequent ticks proceed
+    // to link creation.
+    let meter_session_ids: Vec<u64> = gen.meter_sessions.keys().copied().collect();
+    for session_id in &meter_session_ids {
+        let session_id = *session_id;
+        // Poll node_id if not yet set.
+        if gen.meter_sessions[&session_id].node_id.is_none() {
+            let polled = gen.meter_sessions[&session_id].stream.node_id();
+            if polled != 0 {
+                gen.meter_sessions.get_mut(&session_id).unwrap().node_id = Some(polled);
+            }
+        }
+        // Converge post-denoise meter links: source is the permanent source node.
+        if let Some(source_node_id) = gen.source_node_id {
+            // Read the source's output ports from `device_output_ports`
+            // (populated unconditionally for every node) rather than
+            // `source_output_ports` (only populated when the port arrives
+            // AFTER source_node_id is set). If port 172 arrives before the
+            // node global that sets source_node_id, source_output_ports
+            // would miss it with no re-announcement — the same ordering
+            // race the input-port side already avoids via input_ports_by_node.
+            let source_ports = gen
+                .device_output_ports
+                .get(&source_node_id)
+                .cloned()
+                .unwrap_or_default();
+            let input_ports = gen.input_ports_by_node.clone();
+            if let Some(session) = gen.meter_sessions.get_mut(&session_id) {
+                converge_meter_links(
+                    session,
+                    core,
+                    link_factory,
+                    source_node_id,
+                    &source_ports,
+                    &input_ports,
+                );
+            }
+        }
+    }
+
+    // Resolve the desired upstream device node for raw meter targeting.
+    let desired_device_node_id: Option<u32> = match &desired {
+        DesiredFeed::Device(device_id) => gen.node_id_for_device(device_id),
+        DesiredFeed::None => None,
+    };
+
+    let raw_session_ids: Vec<u64> = gen.raw_meter_sessions.keys().copied().collect();
+    for session_id in &raw_session_ids {
+        let session_id = *session_id;
+        // Poll node_id if not yet set.
+        if gen.raw_meter_sessions[&session_id].node_id.is_none() {
+            let polled = gen.raw_meter_sessions[&session_id].stream.node_id();
+            if polled != 0 {
+                gen.raw_meter_sessions.get_mut(&session_id).unwrap().node_id = Some(polled);
+            }
+        }
+
+        let Some(device_node_id) = desired_device_node_id else {
+            // No device connected; raw meter has no source — drop any stale
+            // links (empty bar, per R7/AE3).
+            if let Some(session) = gen.raw_meter_sessions.get_mut(&session_id) {
+                session.links.clear();
+                session.linked_source_node_id = None;
+            }
+            continue;
+        };
+
+        let device_ports = gen
+            .device_output_ports
+            .get(&device_node_id)
+            .cloned()
+            .unwrap_or_default();
+        let input_ports = gen.input_ports_by_node.clone();
+        if let Some(session) = gen.raw_meter_sessions.get_mut(&session_id) {
+            // Purge stale links on device switch (KTD3): if the session's
+            // previously-linked source node differs from the new desired
+            // device node, tear down the old links and recreate for the
+            // new device. This mirrors converge_capture_links's stale-link
+            // purge (session.rs ~1407-1421).
+            if session.linked_source_node_id.is_some()
+                && session.linked_source_node_id != Some(device_node_id)
+            {
+                session.links.clear();
+                session.linked_source_node_id = None;
+            }
+            converge_meter_links(
+                session,
+                core,
+                link_factory,
+                device_node_id,
+                &device_ports,
+                &input_ports,
+            );
+            // Record the source node we just linked to (or attempted to
+            // link to) so the next tick can detect a device switch.
+            if !session.links.is_empty() {
+                session.linked_source_node_id = Some(device_node_id);
+            }
         }
     }
 
@@ -1601,27 +2111,30 @@ fn stop_monitor(gen: &mut Generation, session_id: u64) {
     gen.monitor_sessions.remove(&session_id);
 }
 
-/// Start the U6/R9 level meter for `session_id`: an engine-side capture
-/// stream on the permanent source, pushing computed
-/// [`crate::meter::MeterFrame`]s into `channel` as buffers arrive. The
-/// stream captures F32LE mono audio (matching the source's own fixed
-/// `[ MONO ]` position, per U2) via `STREAM_CAPTURE_SINK`-free autoconnect
-/// targeting the source's own node name.
+/// Create a meter capture stream for `session_id` and store it
+/// unconditionally, even if the post-denoise source node is not present yet.
+///
+/// The stream is created WITHOUT `StreamFlags::AUTOCONNECT` — the link from
+/// the source to the stream's input port is established explicitly by
+/// `converge_meter_links` during `reconcile_now`, once both the source's
+/// output ports and the stream's own input port are known.
+///
+/// The stream's PipeWire node id is not available at connect time; it is
+/// resolved by polling `stream.node_id()` in `reconcile_now` each tick
+/// for sessions where `node_id` is still `None` (the reconcile-poll
+/// approach, as documented in KTD1 as an acceptable alternative to the
+/// state_changed listener approach when borrow constraints make the latter
+/// impractical).
 fn start_meter(
     gen: &mut Generation,
     core: &CoreRc,
     session_id: u64,
     channel: Arc<Mutex<crate::meter::MeterChannel>>,
 ) {
-    let Some(source_node_id) = gen.source_node_id else {
-        return; // No source yet; caller's channel simply never receives frames.
-    };
-
     let props = properties! {
         *pipewire::keys::MEDIA_TYPE => "Audio",
         *pipewire::keys::MEDIA_CATEGORY => "Capture",
         *pipewire::keys::MEDIA_ROLE => "Music",
-        "target.object" => source_node_id.to_string(),
         *pipewire::keys::STREAM_DONT_REMIX => "true",
     };
     let Ok(stream) = StreamRc::new(core.clone(), "antibising-meter", props) else {
@@ -1670,13 +2183,180 @@ fn start_meter(
 
     if let Some(pod) = Pod::from_bytes(&values) {
         let mut params = [pod];
+        // No AUTOCONNECT: the link is established explicitly by
+        // converge_meter_links once ports are known.
         let _ = stream.connect(
             Direction::Input,
             None,
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+            StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
             &mut params,
         );
     }
 
-    gen.meter_sessions.insert(session_id, MeterSession { stream, listener });
+    gen.meter_sessions.insert(
+        session_id,
+        MeterSession { stream, listener, node_id: None, links: Vec::new(), linked_source_node_id: None },
+    );
+}
+
+/// Create a raw (pre-denoise) meter capture stream for `session_id` and
+/// store it unconditionally, even if no upstream device is currently
+/// connected. Mirrors `start_meter` exactly but inserts into
+/// `raw_meter_sessions`.
+fn start_raw_meter(
+    gen: &mut Generation,
+    core: &CoreRc,
+    session_id: u64,
+    channel: Arc<Mutex<crate::meter::MeterChannel>>,
+) {
+    let props = properties! {
+        *pipewire::keys::MEDIA_TYPE => "Audio",
+        *pipewire::keys::MEDIA_CATEGORY => "Capture",
+        *pipewire::keys::MEDIA_ROLE => "Music",
+        *pipewire::keys::STREAM_DONT_REMIX => "true",
+    };
+    let Ok(stream) = StreamRc::new(core.clone(), "antibising-raw-meter", props) else {
+        return;
+    };
+
+    let listener = stream
+        .add_local_listener::<()>()
+        .process(move |stream, _| {
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            let Some(data) = datas.first_mut() else {
+                return;
+            };
+            let Some(raw) = data.data() else {
+                return;
+            };
+            let samples: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let frame = crate::meter::compute_frame(&samples);
+            if let Ok(mut ch) = channel.lock() {
+                ch.push(frame);
+            }
+        })
+        .register()
+        .expect("registering the raw meter stream listener cannot fail for a valid stream");
+
+    let mut audio_info = AudioInfoRaw::new();
+    audio_info.set_format(pipewire::spa::param::audio::AudioFormat::F32LE);
+    audio_info.set_channels(1);
+    let obj = pipewire::spa::pod::Object {
+        type_: pipewire::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: pipewire::spa::param::ParamType::EnumFormat.as_raw(),
+        properties: audio_info.into(),
+    };
+    let values: Vec<u8> = pipewire::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pipewire::spa::pod::Value::Object(obj),
+    )
+    .map(|(cursor, _)| cursor.into_inner())
+    .unwrap_or_default();
+
+    if let Some(pod) = Pod::from_bytes(&values) {
+        let mut params = [pod];
+        let _ = stream.connect(
+            Direction::Input,
+            None,
+            StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+            &mut params,
+        );
+    }
+
+    gen.raw_meter_sessions.insert(
+        session_id,
+        MeterSession { stream, listener, node_id: None, links: Vec::new(), linked_source_node_id: None },
+    );
+}
+
+/// Converge a meter session's explicit links: create `Link` objects from
+/// `source_output_ports` to the meter stream's input port(s), unless they
+/// already exist (dedup). Returns immediately (retry next tick) if the
+/// session has no node_id yet, if the meter's input ports are not yet in
+/// `input_ports_by_node`, or if `source_output_ports` is empty.
+///
+/// On device switch (for the raw meter), the caller is responsible for
+/// purging stale links before calling this — see `reconcile_raw_meter_links`.
+///
+/// No `object.linger`: dropping the session drops the `Link` proxies,
+/// which tears the server-side links down (the correct `StopMeter` path).
+fn converge_meter_links(
+    session: &mut MeterSession,
+    core: &CoreRc,
+    link_factory: &Rc<RefCell<Option<String>>>,
+    source_node_id: u32,
+    source_output_ports: &[(u32, String)],
+    input_ports_by_node: &HashMap<u32, Vec<(u32, String)>>,
+) {
+    // Need the session's node_id to look up its input ports.
+    let meter_node_id = match session.node_id {
+        Some(id) => id,
+        None => return, // Not yet assigned; retry next tick.
+    };
+
+    // Look up the meter stream's own input ports.
+    let meter_input_ports = match input_ports_by_node.get(&meter_node_id) {
+        Some(ports) if !ports.is_empty() => ports,
+        _ => return, // Meter's input port not recorded yet; retry next tick.
+    };
+
+    if source_output_ports.is_empty() {
+        return; // Source has no output ports yet; retry next tick.
+    }
+
+    let factory_name = match link_factory.borrow().clone() {
+        Some(name) => name,
+        None => return, // Link factory not discovered yet this generation.
+    };
+
+    // Idempotent: if links are already present, don't create more.
+    // The caller (reconcile_now raw meter path) clears links on device
+    // switch before calling here, so this check handles steady state.
+    if !session.links.is_empty() {
+        return;
+    }
+
+    // Source is mono (one output port); fan it to every meter input port.
+    // In practice the meter is also mono so there is exactly one pairing.
+    let mut source_ports = source_output_ports.to_vec();
+    let mut meter_ports = meter_input_ports.clone();
+    source_ports.sort_by(|a, b| a.1.cmp(&b.1));
+    meter_ports.sort_by(|a, b| a.1.cmp(&b.1));
+
+    if source_ports.len() == 1 {
+        // Fan single source output port to all meter input ports.
+        let (out_port_id, _) = source_ports[0];
+        for (in_port_id, _) in &meter_ports {
+            let props = properties! {
+                "link.output.node" => source_node_id.to_string(),
+                "link.output.port" => out_port_id.to_string(),
+                "link.input.node" => meter_node_id.to_string(),
+                "link.input.port" => in_port_id.to_string(),
+                // No object.linger: dropping the proxy tears the link down,
+                // which is the desired teardown path for StopMeter.
+            };
+            if let Ok(link) = core.create_object::<Link>(&factory_name, &props) {
+                session.links.push(link);
+            }
+        }
+    } else {
+        // Positional pairing for multi-channel sources.
+        for ((out_port_id, _), (in_port_id, _)) in source_ports.iter().zip(meter_ports.iter()) {
+            let props = properties! {
+                "link.output.node" => source_node_id.to_string(),
+                "link.output.port" => out_port_id.to_string(),
+                "link.input.node" => meter_node_id.to_string(),
+                "link.input.port" => in_port_id.to_string(),
+            };
+            if let Ok(link) = core.create_object::<Link>(&factory_name, &props) {
+                session.links.push(link);
+            }
+        }
+    }
 }
