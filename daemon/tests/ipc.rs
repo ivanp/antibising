@@ -20,7 +20,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 fn scratch_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("antibising-ipc-test-{}-{}", std::process::id(), rand_suffix()))
+    std::env::temp_dir().join(format!(
+        "antibising-ipc-test-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ))
 }
 
 // Dependency-free unique suffix so parallel test-fn scratch dirs never
@@ -65,7 +69,8 @@ fn start_test_server() -> (
 ) {
     let dir = scratch_dir();
     let paths = IpcPaths::at(dir.clone());
-    let (lock_file, listener) = bind_singleton(&paths).expect("bind_singleton on a fresh scratch dir");
+    let (lock_file, listener) =
+        bind_singleton(&paths).expect("bind_singleton on a fresh scratch dir");
     let guard = ScratchGuard {
         dir,
         _lock_file: lock_file,
@@ -110,7 +115,8 @@ fn read_event(stream: &mut BufReader<UnixStream>) -> Event {
     stream
         .read_line(&mut line)
         .expect("read a line from the server");
-    serde_json::from_str(&line).unwrap_or_else(|e| panic!("failed to parse event line {line:?}: {e}"))
+    serde_json::from_str(&line)
+        .unwrap_or_else(|e| panic!("failed to parse event line {line:?}: {e}"))
 }
 
 fn send_request(stream: &mut UnixStream, request: &Request) {
@@ -136,7 +142,9 @@ fn client_connects_and_receives_hello_then_snapshot() {
         other => panic!("expected Hello, got {other:?}"),
     }
     match read_event(&mut reader) {
-        Event::Snapshot { devices, health, .. } => {
+        Event::Snapshot {
+            devices, health, ..
+        } => {
             assert!(devices.is_empty(), "fresh SharedState has no devices yet");
             assert_eq!(health, HealthStatus::SilentNoDevice);
         }
@@ -162,10 +170,7 @@ fn command_from_one_client_broadcasts_delta_to_both() {
     read_event(&mut client_b); // Snapshot
 
     // Client A sends a control request.
-    send_request(
-        client_a.get_mut(),
-        &Request::SetThreshold { value: 55.0 },
-    );
+    send_request(client_a.get_mut(), &Request::SetThreshold { value: 55.0 });
 
     // The command must have been forwarded into the engine channel.
     let forwarded = cmd_rx
@@ -175,7 +180,9 @@ fn command_from_one_client_broadcasts_delta_to_both() {
         engine::SessionCommand::SetRnnoiseParam(engine::RnnoiseParam::VadThreshold, value) => {
             assert_eq!(value, 55.0);
         }
-        other => panic!("expected SetRnnoiseParam(VadThreshold, 55.0), got a different command: {other:?}"),
+        other => panic!(
+            "expected SetRnnoiseParam(VadThreshold, 55.0), got a different command: {other:?}"
+        ),
     }
 
     // The daemon must have broadcast a fresh Snapshot to every client
@@ -207,7 +214,9 @@ fn command_from_one_client_broadcasts_delta_to_both() {
     for reader in [&mut client_a, &mut client_b] {
         match read_event(reader) {
             Event::HealthChanged(HealthStatus::SilentNoDevice) => {}
-            other => panic!("expected HealthChanged(SilentNoDevice) on both clients, got {other:?}"),
+            other => {
+                panic!("expected HealthChanged(SilentNoDevice) on both clients, got {other:?}")
+            }
         }
     }
 }
@@ -291,8 +300,7 @@ fn stale_socket_after_lock_release_allows_clean_rebind() {
     let dir = scratch_dir();
     let paths = IpcPaths::at(dir.clone());
 
-    let (lock_file, _listener) =
-        bind_singleton(&paths).expect("first bind_singleton must succeed");
+    let (lock_file, _listener) = bind_singleton(&paths).expect("first bind_singleton must succeed");
     assert!(paths.socket_path.exists());
 
     // Simulate the holder dying: drop the lock file, releasing the flock
@@ -300,9 +308,13 @@ fn stale_socket_after_lock_release_allows_clean_rebind() {
     // removing the socket file it left behind.
     drop(lock_file);
 
-    let (_lock_file2, _listener2) = bind_singleton(&paths)
-        .expect("second bind must succeed once the first's lock is released, unlinking the stale socket");
-    assert!(paths.socket_path.exists(), "new instance must have re-bound the socket");
+    let (_lock_file2, _listener2) = bind_singleton(&paths).expect(
+        "second bind must succeed once the first's lock is released, unlinking the stale socket",
+    );
+    assert!(
+        paths.socket_path.exists(),
+        "new instance must have re-bound the socket"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -455,10 +467,10 @@ fn start_meter_forwards_command_and_drains_frames_to_client() {
 
     // Push a frame the way session.rs's own capture-stream callback
     // would, standing in for a live engine session.
-    channel
-        .lock()
-        .unwrap()
-        .push(engine::MeterFrame { rms: 0.42, peak: 0.9 });
+    channel.lock().unwrap().push(engine::MeterFrame {
+        rms: 0.42,
+        peak: 0.9,
+    });
 
     match read_event(&mut client) {
         Event::MeterFrame(frame) => {
@@ -492,12 +504,16 @@ fn client_disconnect_releases_its_monitor_and_meter_sessions() {
     // StopMeter on exit, regardless of what this session actually held
     // -- idempotent on the engine side, and simpler than tracking
     // per-session what was actually active.
-    let first = cmd_rx.recv_timeout(Duration::from_secs(2)).expect("StopMonitor on disconnect");
+    let first = cmd_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("StopMonitor on disconnect");
     assert!(
         matches!(first, engine::SessionCommand::StopMonitor(_)),
         "expected StopMonitor on disconnect, got {first:?}"
     );
-    let second = cmd_rx.recv_timeout(Duration::from_secs(2)).expect("StopMeter on disconnect");
+    let second = cmd_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("StopMeter on disconnect");
     assert!(
         matches!(second, engine::SessionCommand::StopMeter(_)),
         "expected StopMeter on disconnect, got {second:?}"

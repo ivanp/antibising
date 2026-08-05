@@ -151,7 +151,9 @@ fn cmd_run() {
     // only fires on "capture node not present," a narrower check than
     // "filter-chain.service itself failed to start").
     if let Some(reason) = &startup_broken_reason {
-        initial_state.health = engine::HealthStatus::Broken { reason: reason.clone() };
+        initial_state.health = engine::HealthStatus::Broken {
+            reason: reason.clone(),
+        };
     }
     let shared = Arc::new(Mutex::new(initial_state));
     let broadcaster = Broadcaster::new();
@@ -162,7 +164,13 @@ fn cmd_run() {
         let broadcaster = broadcaster.clone();
         let session_registry = session_registry.clone();
         std::thread::spawn(move || {
-            accept_loop(listener, shared, broadcaster, session_registry, session_cmd_tx)
+            accept_loop(
+                listener,
+                shared,
+                broadcaster,
+                session_registry,
+                session_cmd_tx,
+            )
         });
     }
 
@@ -345,9 +353,8 @@ fn reconcile_startup() -> Option<String> {
                     );
                     let content = engine::render_fragment(&fragment_config);
                     if let Err(e) = engine::write_atomic(&paths.fragment_path, &content) {
-                        let reason = format!(
-                            "failed to regenerate fragment after cold-start failure: {e}"
-                        );
+                        let reason =
+                            format!("failed to regenerate fragment after cold-start failure: {e}");
                         tracing::error!("{reason}");
                         return Some(reason);
                     }
@@ -493,7 +500,6 @@ fn wait_for_source_bool(name: &str, timeout: Duration) -> bool {
     false
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,7 +566,10 @@ mod tests {
         let mut known = vec![dev("a"), dev("b")];
         let order = update_known_devices(&mut known, &engine::SessionEvent::Disconnected);
         assert_eq!(order, None, "Disconnected itself never triggers a resend");
-        assert!(known.is_empty(), "known_devices must be cleared on disconnect");
+        assert!(
+            known.is_empty(),
+            "known_devices must be cleared on disconnect"
+        );
     }
 
     /// The regression this fix exists to prevent: without clearing on
@@ -632,6 +641,9 @@ mod tests {
             &mut known,
             &engine::SessionEvent::Snapshot(vec![device_info("razer")]),
         );
-        assert_eq!(snapshot, None, "device already known from DeviceArrived -> no resend");
+        assert_eq!(
+            snapshot, None,
+            "device already known from DeviceArrived -> no resend"
+        );
     }
 }

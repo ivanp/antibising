@@ -149,7 +149,10 @@ impl std::fmt::Display for BindError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BindError::AlreadyRunning => {
-                write!(f, "another antibisingd instance is already running (socket busy)")
+                write!(
+                    f,
+                    "another antibisingd instance is already running (socket busy)"
+                )
             }
             BindError::Io(e) => write!(f, "IPC bind failed: {e}"),
         }
@@ -195,6 +198,13 @@ pub enum Request {
     /// Unsubscribe from the level meter. Idempotent: a no-op if no meter
     /// session is active.
     StopMeter,
+    /// Subscribe connection to raw (pre-denoise) level meter — engine-side
+    /// capture stream from the upstream device starts producing
+    /// `Event::RawMeterFrame`s. Idempotent while subscribed.
+    StartRawMeter,
+    /// Unsubscribe raw level meter. Idempotent: no-op if no raw meter
+    /// session active.
+    StopRawMeter,
 }
 
 /// Events pushed from daemon to client. `Snapshot` on connect and on
@@ -204,7 +214,9 @@ pub enum Request {
 pub enum Event {
     /// Sent once, immediately after connect — names the protocol version
     /// so a future client generation can detect a mismatch.
-    Hello { protocol_version: u32 },
+    Hello {
+        protocol_version: u32,
+    },
     /// Full current state: every known device, the current health
     /// verdict, and the persisted config (pin/order/denoise settings) —
     /// enough for a client to render its whole UI with no further
@@ -220,16 +232,22 @@ pub enum Event {
     /// enum variant when carried as a tuple payload -- serde requires
     /// every variant's payload to serialize as a map so the tag can be
     /// merged in. A struct variant sidesteps that entirely.
-    DeviceDeparted { id: engine::DeviceId },
+    DeviceDeparted {
+        id: engine::DeviceId,
+    },
     HealthChanged(HealthStatus),
     /// This connection's `StartMonitor` succeeded — links exist. Carries
     /// the R9 speaker-vs-headset assessment as an inline warning (never
     /// a refusal). Reaches only the requesting connection (per-session,
     /// like `Error`) via `SessionRegistry`, never broadcast.
-    MonitorStarted { speaker_risk: engine::SpeakerRisk },
+    MonitorStarted {
+        speaker_risk: engine::SpeakerRisk,
+    },
     /// This connection's `StartMonitor` could not proceed (e.g. no
     /// default sink resolved yet). Per-session, not broadcast.
-    MonitorFailed { reason: String },
+    MonitorFailed {
+        reason: String,
+    },
     /// This connection's monitor session ended — explicit `StopMonitor`,
     /// or implied by disconnect. Per-session, not broadcast.
     MonitorStopped,
@@ -237,11 +255,17 @@ pub enum Event {
     /// connections currently subscribed via `StartMeter` — never
     /// broadcast to clients that never asked for it.
     MeterFrame(engine::MeterFrame),
+    /// One live raw (pre-denoise) level-meter measurement, pushed only to
+    /// connections currently subscribed via `StartRawMeter` — not
+    /// broadcast to clients that didn't ask for it.
+    RawMeterFrame(engine::MeterFrame),
     /// A request this connection sent was malformed or invalid — sent
     /// only to the connection that sent it; the connection survives (per
     /// the plan's own test scenario: malformed message -> error reply,
     /// connection survives, daemon never panics).
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 fn write_event(stream: &mut UnixStream, event: &Event) -> std::io::Result<()> {
@@ -380,7 +404,10 @@ impl SessionRegistry {
     /// cleanup already tore that session down from the engine's side
     /// too.
     pub fn send_to(&self, session_id: u64, event: &Event) {
-        let sessions = self.sessions.lock().expect("session registry mutex poisoned");
+        let sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
         if let Some(writer) = sessions.get(&session_id) {
             let mut stream = writer.lock().expect("client writer mutex poisoned");
             let _ = write_event(&mut stream, event);
@@ -418,6 +445,7 @@ pub fn apply_request(
     session_cmd_tx: &std::sync::mpsc::Sender<SessionCommand>,
     session_id: u64,
     meter_slot: &Arc<Mutex<Option<Arc<Mutex<engine::MeterChannel>>>>>,
+    raw_meter_slot: &Arc<Mutex<Option<Arc<Mutex<engine::MeterChannel>>>>>,
 ) -> Result<bool, String> {
     match request {
         Request::RequestSnapshot => {
@@ -474,7 +502,9 @@ pub fn apply_request(
             // owns exactly the channel it was handed, so replacing the
             // slot here and sending the new Arc keeps both sides
             // pointing at the same live queue.
-            let channel = Arc::new(Mutex::new(engine::MeterChannel::new(METER_CHANNEL_CAPACITY)));
+            let channel = Arc::new(Mutex::new(engine::MeterChannel::new(
+                METER_CHANNEL_CAPACITY,
+            )));
             *meter_slot.lock().expect("meter slot mutex poisoned") = Some(channel.clone());
             let _ = session_cmd_tx.send(SessionCommand::StartMeter(session_id, channel));
             Ok(false)
@@ -482,6 +512,29 @@ pub fn apply_request(
         Request::StopMeter => {
             *meter_slot.lock().expect("meter slot mutex poisoned") = None;
             let _ = session_cmd_tx.send(SessionCommand::StopMeter(session_id));
+            Ok(false)
+        }
+
+        Request::StartRawMeter => {
+            // Fresh channel every StartRawMeter (including re-subscribe
+            // after StopRawMeter); the engine's own StartRawMeter session
+            // owns exactly the channel it's handed. Replacing the
+            // slot by sending a new Arc keeps both sides pointing at the
+            // same live queue.
+            let channel = Arc::new(Mutex::new(engine::MeterChannel::new(
+                METER_CHANNEL_CAPACITY,
+            )));
+            *raw_meter_slot
+                .lock()
+                .expect("raw meter slot mutex poisoned") = Some(channel.clone());
+            let _ = session_cmd_tx.send(SessionCommand::StartRawMeter(session_id, channel));
+            Ok(false)
+        }
+        Request::StopRawMeter => {
+            *raw_meter_slot
+                .lock()
+                .expect("raw meter slot mutex poisoned") = None;
+            let _ = session_cmd_tx.send(SessionCommand::StopRawMeter(session_id));
             Ok(false)
         }
     }
@@ -545,13 +598,50 @@ fn handle_client(
         std::thread::spawn(move || {
             while !meter_stop.load(Ordering::Relaxed) {
                 std::thread::sleep(METER_POLL_INTERVAL);
-                let channel = meter_slot.lock().expect("meter slot mutex poisoned").clone();
+                let channel = meter_slot
+                    .lock()
+                    .expect("meter slot mutex poisoned")
+                    .clone();
                 let Some(channel) = channel else { continue };
-                let frames = channel.lock().expect("meter channel mutex poisoned").drain();
+                let frames = channel
+                    .lock()
+                    .expect("meter channel mutex poisoned")
+                    .drain();
                 for frame in frames {
                     let mut w = write_handle.lock().expect("client writer mutex poisoned");
                     if write_event(&mut w, &Event::MeterFrame(frame)).is_err() {
                         return; // client gone; the read loop will notice too
+                    }
+                }
+            }
+        })
+    }; // Raw meter drain thread: mirrors the post-denoise meter drain above,
+       // polling `raw_meter_slot` and emitting `Event::RawMeterFrame`.
+    let raw_meter_slot: Arc<Mutex<Option<Arc<Mutex<engine::MeterChannel>>>>> =
+        Arc::new(Mutex::new(None));
+    let raw_meter_stop = Arc::new(AtomicBool::new(false));
+    let raw_drain_handle = {
+        let raw_meter_slot = raw_meter_slot.clone();
+        let raw_meter_stop = raw_meter_stop.clone();
+        let write_handle = write_handle.clone();
+        std::thread::spawn(move || {
+            while !raw_meter_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(METER_POLL_INTERVAL);
+                let channel = raw_meter_slot
+                    .lock()
+                    .expect("raw meter slot mutex poisoned")
+                    .clone();
+                let Some(channel) = channel else { continue };
+                let frames: Vec<_> = channel
+                    .lock()
+                    .expect("raw meter channel mutex poisoned")
+                    .drain()
+                    .into_iter()
+                    .collect();
+                for frame in frames {
+                    let mut w = write_handle.lock().expect("client writer mutex poisoned");
+                    if write_event(&mut w, &Event::RawMeterFrame(frame)).is_err() {
+                        return; // client gone; read loop will notice
                     }
                 }
             }
@@ -570,7 +660,14 @@ fn handle_client(
         match serde_json::from_str::<Request>(&line) {
             Ok(request) => {
                 let mut state = shared.lock().expect("shared state mutex poisoned");
-                match apply_request(request, &mut state.config, &session_cmd_tx, session_id, &meter_slot) {
+                match apply_request(
+                    request,
+                    &mut state.config,
+                    &session_cmd_tx,
+                    session_id,
+                    &meter_slot,
+                    &raw_meter_slot,
+                ) {
                     Ok(config_changed) => {
                         if config_changed {
                             let content = toml::to_string_pretty(&state.config)
@@ -635,9 +732,12 @@ fn handle_client(
     // started either.
     let _ = session_cmd_tx.send(SessionCommand::StopMonitor(session_id));
     let _ = session_cmd_tx.send(SessionCommand::StopMeter(session_id));
+    let _ = session_cmd_tx.send(SessionCommand::StopRawMeter(session_id));
     session_registry.unregister(session_id);
     meter_stop.store(true, Ordering::Relaxed);
     let _ = drain_handle.join();
+    raw_meter_stop.store(true, Ordering::Relaxed);
+    let _ = raw_drain_handle.join();
 
     // The broadcaster still holds `write_handle` until its *next*
     // broadcast attempt fails and prunes it (Broadcaster::broadcast's
@@ -665,7 +765,13 @@ pub fn accept_loop(
         let session_registry = session_registry.clone();
         let session_cmd_tx = session_cmd_tx.clone();
         std::thread::spawn(move || {
-            handle_client(stream, shared, broadcaster, session_registry, session_cmd_tx)
+            handle_client(
+                stream,
+                shared,
+                broadcaster,
+                session_registry,
+                session_cmd_tx,
+            )
         });
     }
 }
@@ -714,7 +820,10 @@ pub fn handle_session_event(
             drop(state);
             broadcaster.broadcast(&Event::HealthChanged(HealthStatus::Reconnecting));
         }
-        SessionEvent::MonitorStarted { session_id, speaker_risk } => {
+        SessionEvent::MonitorStarted {
+            session_id,
+            speaker_risk,
+        } => {
             session_registry.send_to(session_id, &Event::MonitorStarted { speaker_risk });
         }
         SessionEvent::MonitorFailed { session_id, reason } => {
@@ -744,7 +853,8 @@ mod tests {
         tx: &std::sync::mpsc::Sender<SessionCommand>,
     ) -> Result<bool, String> {
         let meter_slot = Arc::new(Mutex::new(None));
-        apply_request(request, config, tx, 0, &meter_slot)
+        let raw_meter_slot = Arc::new(Mutex::new(None));
+        apply_request(request, config, tx, 0, &meter_slot, &raw_meter_slot)
     }
 
     #[test]
@@ -761,7 +871,9 @@ mod tests {
         .unwrap();
         assert_eq!(config.pin, Some("dev-a".to_string()));
         match rx.try_recv().unwrap() {
-            SessionCommand::SetPin(Some(id)) => assert_eq!(id, engine::DeviceId("dev-a".to_string())),
+            SessionCommand::SetPin(Some(id)) => {
+                assert_eq!(id, engine::DeviceId("dev-a".to_string()))
+            }
             _ => panic!("expected SetPin(Some(..))"),
         }
     }
@@ -791,10 +903,19 @@ mod tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(config.preference_order, vec!["dev-a".to_string(), "dev-b".to_string()]);
+        assert_eq!(
+            config.preference_order,
+            vec!["dev-a".to_string(), "dev-b".to_string()]
+        );
         match rx.try_recv().unwrap() {
             SessionCommand::SetPreferenceOrder(ids) => {
-                assert_eq!(ids, vec![engine::DeviceId("dev-a".to_string()), engine::DeviceId("dev-b".to_string())]);
+                assert_eq!(
+                    ids,
+                    vec![
+                        engine::DeviceId("dev-a".to_string()),
+                        engine::DeviceId("dev-b".to_string())
+                    ]
+                );
             }
             _ => panic!("expected SetPreferenceOrder"),
         }
@@ -851,7 +972,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         test_apply(Request::RequestSnapshot, &mut config, &tx).unwrap();
         assert_eq!(config, before);
-        assert!(matches!(rx.try_recv().unwrap(), SessionCommand::RequestSnapshot));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SessionCommand::RequestSnapshot
+        ));
     }
 
     #[test]
@@ -874,7 +998,10 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let back: Event = serde_json::from_str(&json).unwrap();
         match back {
-            Event::HealthChanged(HealthStatus::Linked { device, description }) => {
+            Event::HealthChanged(HealthStatus::Linked {
+                device,
+                description,
+            }) => {
                 assert_eq!(device, engine::DeviceId("dev-a".to_string()));
                 assert_eq!(description, "Razer Seiren Mini");
             }
@@ -900,20 +1027,37 @@ mod tests {
             description: "Razer".to_string(),
         };
         let variants = [
-            Event::Hello { protocol_version: PROTOCOL_VERSION },
+            Event::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
             Event::Snapshot {
                 devices: vec![device_info.clone()],
                 health: HealthStatus::SilentNoDevice,
                 config: test_config(),
             },
             Event::DeviceArrived(device_info.clone()),
-            Event::DeviceDeparted { id: device_info.id.clone() },
+            Event::DeviceDeparted {
+                id: device_info.id.clone(),
+            },
             Event::HealthChanged(HealthStatus::SilentNoDevice),
-            Event::MonitorStarted { speaker_risk: engine::SpeakerRisk::Unknown },
-            Event::MonitorFailed { reason: "no default sink".to_string() },
+            Event::MonitorStarted {
+                speaker_risk: engine::SpeakerRisk::Unknown,
+            },
+            Event::MonitorFailed {
+                reason: "no default sink".to_string(),
+            },
             Event::MonitorStopped,
-            Event::MeterFrame(engine::MeterFrame { rms: 0.1, peak: 0.2 }),
-            Event::Error { message: "malformed request".to_string() },
+            Event::MeterFrame(engine::MeterFrame {
+                rms: 0.1,
+                peak: 0.2,
+            }),
+            Event::RawMeterFrame(engine::MeterFrame {
+                rms: 0.1,
+                peak: 0.2,
+            }),
+            Event::Error {
+                message: "malformed request".to_string(),
+            },
         ];
         for event in variants {
             let json = serde_json::to_string(&event)
@@ -942,7 +1086,9 @@ mod tests {
         broadcaster.register(writer);
         drop(b); // peer gone -> next write on `a` fails
 
-        broadcaster.broadcast(&Event::Hello { protocol_version: PROTOCOL_VERSION });
+        broadcaster.broadcast(&Event::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        });
         assert_eq!(
             broadcaster.clients.lock().unwrap().len(),
             0,
@@ -965,7 +1111,9 @@ mod tests {
         };
 
         match state.snapshot_event() {
-            Event::Snapshot { devices, health, .. } => {
+            Event::Snapshot {
+                devices, health, ..
+            } => {
                 assert_eq!(devices, vec![info.clone()]);
                 assert_eq!(
                     health,
