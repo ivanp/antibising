@@ -19,6 +19,10 @@ tauri = { version = "2", features = [] }
 # on its own tokio task. Default `tokio` feature per the plan's decision
 # (Tauri already ships its own tokio runtime).
 ksni = "0.3"
+# tokio (time feature only): the tray's ~15 Hz update loop uses
+# tokio::time::interval. Tokio is already pulled in transitively by
+# both ksni and tauri; this just makes the time utilities linkable.
+tokio = { version = "1", features = ["time"] }
 # tauri-plugin-single-instance (U9): a manual `pin`/`preference_order`
 # and the daemon's own IPC flock already make a *second daemon*
 # instance refuse to start (U10's `bind_singleton`) — this plugin is

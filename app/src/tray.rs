@@ -20,17 +20,86 @@ use engine::HealthStatus;
 use ksni::menu::{CheckmarkItem, MenuItem, StandardItem};
 use ksni::{Tray, TrayMethods};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tauri::{AppHandle, Manager};
+
+
+const MIC_SIZE: i32 = 22;
+
+const WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+const GREEN: [u8; 4] = [0xFF, 0x00, 0xCC, 0x44];
+
+fn is_mic_shape(x: i32, y: i32) -> bool {
+    // Top cap (semicircle approximation)
+    if y == 2 && (9..=13).contains(&x) { return true; }
+    if y == 3 && (8..=14).contains(&x) { return true; }
+    // Body
+    if (4..=12).contains(&y) && (8..=14).contains(&x) { return true; }
+    // Bottom of body (rounded)
+    if y == 13 && (9..=13).contains(&x) { return true; }
+    // Cradle arc
+    if y == 14 && ((7..=8).contains(&x) || (14..=15).contains(&x)) { return true; }
+    if y == 15 && (x == 7 || x == 15) { return true; }
+    if y == 16 && (8..=14).contains(&x) && !(9..=13).contains(&x) { return true; }
+    // Stem
+    if (16..=17).contains(&y) && (10..=12).contains(&x) { return true; }
+    // Base
+    if y == 18 && (8..=14).contains(&x) { return true; }
+    false
+}
+
+fn render_icon(level: f32) -> Vec<u8> {
+    let size = MIC_SIZE;
+    let mut buf = vec![0u8; (size * size * 4) as usize];
+    let clamped = level.clamp(0.0, 1.0);
+
+    // The mic body (the fillable region) spans rows BODY_TOP..=BODY_BOTTOM.
+    // Cradle, stem, and base (rows 14–18) are structural and stay white.
+    const BODY_TOP: i32 = 2;
+    const BODY_BOTTOM: i32 = 13;
+    const BODY_HEIGHT: i32 = BODY_BOTTOM - BODY_TOP + 1; // 12 rows
+
+    // fill_row: rows at-and-below this get green (within the body).
+    // level 0.0 → fill_row = BODY_BOTTOM + 1 (nothing filled)
+    // level 1.0 → fill_row = BODY_TOP (everything filled)
+    let fill_row = BODY_BOTTOM + 1 - (clamped * BODY_HEIGHT as f32) as i32;
+
+    for y in 0..size {
+        for x in 0..size {
+            if is_mic_shape(x, y) {
+                let offset = ((y * size + x) * 4) as usize;
+                // Green fill only in the body region (rows 2–13).
+                let color = if y >= fill_row && y <= BODY_BOTTOM {
+                    GREEN
+                } else {
+                    WHITE
+                };
+                buf[offset..offset + 4].copy_from_slice(&color);
+            }
+        }
+    }
+    buf
+}
 
 /// The ksni tray. Holds an `AppHandle` (Send+Sync, per
 /// `docs/ksni-tauri-coexistence.md` §4) to show/focus the panel window
 /// from `activate()`, and the shared `Bridge` to read current state for
-/// `icon_name()`/`menu()` and to send `set_pin`/`toggle_denoise`
-/// commands from menu actions — the same bridge the webview's commands
-/// use, so pinning from the tray menu is not a second code path.
+/// `icon_name()`/`icon_pixmap()`/`menu()` and to send `set_pin`/
+/// `toggle_denoise` commands from menu actions — the same bridge the
+/// webview's commands use, so pinning from the tray menu is not a
+/// second code path.
 pub struct AntibisingTray {
     app: AppHandle,
     bridge: Arc<Bridge>,
+    /// Smoothed audio level (0.0–1.0) for the tray icon's green fill.
+    smoothed_level: f32,
+    /// Monotonically increasing counter bumped on watcher_online to
+    /// force a tooltip change so ksni re-announces after a waybar restart.
+    refresh_seq: u32,
+    /// Set by watcher_online (synchronous, &self only), consumed by the
+    /// update loop's next tick to bump refresh_seq.
+    force_icon_refresh: Arc<AtomicBool>,
 }
 
 impl Tray for AntibisingTray {
@@ -42,14 +111,14 @@ impl Tray for AntibisingTray {
         "antibising".into()
     }
 
-    /// Health-derived icon (R5: icon honesty — it reflects the daemon's
-    /// own verdict, never an assumption). Falls back to the muted/silent
-    /// icon when the bridge has no snapshot yet (daemon unreachable or
-    /// still connecting) — an honest "nothing confirmed" state, not a
-    /// false "healthy" default.
+    /// Health-derived icon name. When Linked, returns an empty string so
+    /// waybar falls through to `icon_pixmap()` (KTD4 — waybar resolves
+    /// IconName first; a valid theme name would prevent the pixmap from
+    /// ever being consulted). Non-Linked states return their themed
+    /// icons as before.
     fn icon_name(&self) -> String {
         match self.bridge.last_health() {
-            Some(HealthStatus::Linked { .. }) => "microphone-sensitivity-high-symbolic".into(),
+            Some(HealthStatus::Linked { .. }) => String::new(),
             Some(HealthStatus::Broken { .. }) => "dialog-warning-symbolic".into(),
             Some(HealthStatus::Reconnecting) => "view-refresh-symbolic".into(),
             Some(HealthStatus::SilentNoDevice) | None => {
@@ -58,14 +127,37 @@ impl Tray for AntibisingTray {
         }
     }
 
+    /// Custom pixmap for the level meter (KTD4). When Linked, returns
+    /// the microphone silhouette with green fill proportional to
+    /// `smoothed_level`. Non-Linked states return an empty vec so
+    /// waybar uses `icon_name()` instead.
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        if matches!(self.bridge.last_health(), Some(HealthStatus::Linked { .. })) {
+            vec![ksni::Icon {
+                width: MIC_SIZE,
+                height: MIC_SIZE,
+                data: render_icon(self.smoothed_level),
+            }]
+        } else {
+            vec![]
+        }
+    }
+
     fn tool_tip(&self) -> ksni::ToolTip {
-        let description = match self.bridge.last_health() {
+        let mut description = match self.bridge.last_health() {
             Some(HealthStatus::Linked { description, .. }) => description,
             Some(HealthStatus::Broken { reason }) => format!("Broken: {reason}"),
             Some(HealthStatus::Reconnecting) => "Reconnecting…".to_string(),
             Some(HealthStatus::SilentNoDevice) => "No microphone".to_string(),
             None => "Daemon unreachable".to_string(),
         };
+        // Append an invisible revision tag so a watcher_online bump
+        // changes the tooltip hash even when the text is unchanged —
+        // ksni only emits NewToolTip when the hash differs.
+        if self.refresh_seq > 0 {
+            use std::fmt::Write;
+            let _ = write!(description, " (r{})", self.refresh_seq);
+        }
         ksni::ToolTip {
             title: "antibising".into(),
             description,
@@ -188,14 +280,15 @@ impl Tray for AntibisingTray {
     /// from the tray's very first (pre-connect) registration.
     fn menu_about_to_show(&mut self) {}
 
-    /// Bar/watcher restart survival (U8's own test scenario): ksni
-    /// re-registers the item automatically on `watcher_online` (the
-    /// zbus connection itself survives a bar restart); no extra work
-    /// is needed here since `icon_name`/`tool_tip` are read live on
-    /// every property fetch and `menu_about_to_show` above already
-    /// refreshes the menu on the newly-restarted bar's very first
-    /// click.
-    fn watcher_online(&self) {}
+    /// Bar/watcher restart: set the force-refresh flag so the update
+    /// loop's next tick bumps `refresh_seq`, changing the tooltip hash
+    /// and forcing ksni to re-announce all properties (including
+    /// IconPixmap) to the restarted host. Without this, a steady-state
+    /// pixmap (silence, sustained noise) produces an empty diff and
+    /// waybar stays blank after restart.
+    fn watcher_online(&self) {
+        self.force_icon_refresh.store(true, Ordering::Relaxed);
+    }
 }
 
 fn quit_item() -> MenuItem<AntibisingTray> {
@@ -210,27 +303,155 @@ fn quit_item() -> MenuItem<AntibisingTray> {
     .into()
 }
 
-/// Spawn the tray on Tauri's own tokio runtime (`tauri::async_runtime`,
-/// not a bare `tokio::spawn` -- keeps the tray on the same executor
-/// Tauri already manages, per the plan's own decision to use ksni's
-/// default `tokio` feature).
+/// Spawn the tray on Tauri's own tokio runtime and enter a ~15 Hz
+/// update loop that reads the Bridge meter cache, applies fast-rise /
+/// slow-decay smoothing, and pushes pixmap updates via the retained
+/// ksni `Handle`.
 ///
-/// The `Handle` returned by `TrayMethods::spawn` is intentionally
-/// dropped here: it only holds a `Weak` reference into the tray
-/// service plus an update-channel sender (verified in ksni's own
-/// `service::run` -- the D-Bus event loop itself is spawned as an
-/// independent task holding the real `Arc`), so dropping it forfeits
-/// only the ability to explicitly push an update — it does NOT stop
-/// the running tray. No explicit push is needed: `icon_name`/
-/// `tool_tip` are read live on every property fetch, and `menu()` is
-/// refreshed via `menu_about_to_show`'s override just before the host
-/// displays it (see that method's doc comment for why the override is
-/// required at all).
+/// The `Handle` is now retained (previously dropped) so
+/// `handle.update()` can signal property changes to waybar. Each tick
+/// reads the smoothed level and calls `handle.update()`, which diffs
+/// properties and emits `NewIcon` only when the pixmap actually
+/// changed.
 pub fn spawn(app: AppHandle, bridge: Arc<Bridge>) {
+    // Decay factor per tick at ~15 Hz: half-life ~266ms, zero-out ~1.9s.
+    const DECAY_FACTOR: f32 = 0.85;
+    const LEVEL_FLOOR: f32 = 0.01;
+    const UPDATE_INTERVAL: Duration = Duration::from_millis(66);
+
+    let force_flag = Arc::new(AtomicBool::new(false));
+
     tauri::async_runtime::spawn(async move {
-        let tray = AntibisingTray { app, bridge };
-        if let Err(e) = tray.spawn().await {
-            eprintln!("tray: failed to start ksni service: {e}");
+        // Subscribe to the meter stream — always-on (R2, KD2).
+        match bridge.acquire_meter() {
+            Ok(()) => eprintln!("tray: acquire_meter succeeded"),
+            Err(e) => eprintln!("tray: acquire_meter FAILED: {e}"),
+        }
+
+        let tray = AntibisingTray {
+            app,
+            bridge,
+            smoothed_level: 0.0,
+            refresh_seq: 0,
+            force_icon_refresh: force_flag,
+        };
+        let handle = match tray.spawn().await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("tray: failed to start ksni service: {e}");
+                return;
+            }
+        };
+
+        let mut interval = tokio::time::interval(UPDATE_INTERVAL);
+        loop {
+            interval.tick().await;
+            handle
+                .update(|tray: &mut AntibisingTray| {
+                    // Read the latest meter frame from Bridge's cache.
+                    let meter = tray.bridge.last_meter();
+                    if let Some(frame) = meter {
+                        // Map RMS to 0.0–1.0 display level. Post-denoise
+                        // speech at desk distance produces RMS ~0.01–0.05;
+                        // a linear ×2 scale leaves that invisible. Use a
+                        // power curve: sqrt(rms / reference) where reference
+                        // 0.05 = "normal speech ≈ full". The sqrt compresses
+                        // dynamic range so quiet speech is still visible.
+                        let reference = 0.05_f32;
+                        let level = f32::min(1.0, (frame.rms / reference).sqrt());
+                        // Fast rise, slow decay.
+                        tray.smoothed_level =
+                            f32::max(level, tray.smoothed_level * DECAY_FACTOR);
+                    } else {
+                        // No data — decay only.
+                        tray.smoothed_level *= DECAY_FACTOR;
+                    }
+                    // Clamp to zero below the floor to avoid rendering noise.
+                    if tray.smoothed_level < LEVEL_FLOOR {
+                        tray.smoothed_level = 0.0;
+                    }
+                    // Force-refresh after a watcher_online event.
+                    if tray.force_icon_refresh.swap(false, Ordering::Relaxed) {
+                        tray.refresh_seq = tray.refresh_seq.wrapping_add(1);
+                    }
+                })
+                .await;
         }
     });
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_icon_output_size() {
+        let buf = render_icon(0.0);
+        assert_eq!(buf.len(), (MIC_SIZE * MIC_SIZE * 4) as usize);
+    }
+
+    #[test]
+    fn render_icon_zero_has_no_green() {
+        let buf = render_icon(0.0);
+        for y in 0..MIC_SIZE {
+            for x in 0..MIC_SIZE {
+                let off = ((y * MIC_SIZE + x) * 4) as usize;
+                let pixel = &buf[off..off + 4];
+                assert_ne!(pixel, &GREEN, "green pixel found at ({x}, {y}) with level 0.0");
+            }
+        }
+    }
+
+    #[test]
+    fn render_icon_full_body_is_all_green() {
+        let buf = render_icon(1.0);
+        // Body pixels (rows 2–13) should all be green at level 1.0.
+        // Structural pixels (cradle/stem/base, rows 14–18) stay white.
+        for y in 0..MIC_SIZE {
+            for x in 0..MIC_SIZE {
+                if is_mic_shape(x, y) {
+                    let off = ((y * MIC_SIZE + x) * 4) as usize;
+                    let pixel = &buf[off..off + 4];
+                    if y <= 13 {
+                        assert_eq!(pixel, &GREEN, "body pixel at ({x}, {y}) should be green at level 1.0");
+                    } else {
+                        assert_eq!(pixel, &WHITE, "structural pixel at ({x}, {y}) should be white at level 1.0");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_icon_half_has_both_colors() {
+        let buf = render_icon(0.5);
+        let mut has_green = false;
+        let mut has_white = false;
+        for y in 0..MIC_SIZE {
+            for x in 0..MIC_SIZE {
+                if is_mic_shape(x, y) {
+                    let off = ((y * MIC_SIZE + x) * 4) as usize;
+                    let pixel = &buf[off..off + 4];
+                    if pixel == &GREEN { has_green = true; }
+                    if pixel == &WHITE { has_white = true; }
+                }
+            }
+        }
+        assert!(has_green, "no green pixels at level 0.5");
+        assert!(has_white, "no white pixels at level 0.5");
+    }
+
+    #[test]
+    fn render_icon_non_shape_pixels_transparent() {
+        let buf = render_icon(0.5);
+        for y in 0..MIC_SIZE {
+            for x in 0..MIC_SIZE {
+                if !is_mic_shape(x, y) {
+                    let off = ((y * MIC_SIZE + x) * 4) as usize;
+                    assert_eq!(buf[off], 0x00, "non-shape pixel at ({x}, {y}) has non-zero alpha");
+                }
+            }
+        }
+    }
 }
