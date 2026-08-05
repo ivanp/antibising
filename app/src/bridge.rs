@@ -15,8 +15,10 @@
 use antibisingd::ipc::{Event, IpcPaths, Request};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use engine::MeterFrame;
 use tauri::{AppHandle, Emitter};
 
 /// Event name the bridge emits every daemon `Event` under, tagged so the
@@ -70,6 +72,9 @@ pub struct Bridge {
     conn: Mutex<Option<Connection>>,
     last: Mutex<LastState>,
     paths: IpcPaths,
+    meter_leases: AtomicUsize,
+    last_meter: Mutex<Option<MeterFrame>>,
+    last_health_cache: Mutex<Option<engine::HealthStatus>>,
 }
 
 impl Bridge {
@@ -78,6 +83,9 @@ impl Bridge {
             conn: Mutex::new(None),
             last: Mutex::new(LastState::default()),
             paths,
+            meter_leases: AtomicUsize::new(0),
+            last_meter: Mutex::new(None),
+            last_health_cache: Mutex::new(None),
         }
     }
 
@@ -113,10 +121,7 @@ impl Bridge {
     /// identically to `SilentNoDevice` (an honest "nothing confirmed"
     /// icon, never a false "healthy" default).
     pub fn last_health(&self) -> Option<engine::HealthStatus> {
-        match self.last_snapshot()? {
-            Event::Snapshot { health, .. } => Some(health),
-            _ => None,
-        }
+        self.last_health_cache.lock().expect("bridge last_health_cache mutex poisoned").clone()
     }
 
     /// Send `SetPin` — the identical command the panel's own dropdown
@@ -130,6 +135,29 @@ impl Bridge {
     /// button issues (R6: one routing path).
     pub fn send_toggle_denoise(&self, enabled: bool) -> Result<(), String> {
         self.send(&Request::ToggleDenoise { enabled })
+    }
+
+    pub fn acquire_meter(&self) -> Result<(), String> {
+        let prev = self.meter_leases.fetch_add(1, Ordering::Relaxed);
+        if prev == 0 {
+            self.send(&Request::StartMeter)?;
+        }
+        Ok(())
+    }
+
+    pub fn release_meter(&self) {
+        let prev = self.meter_leases.load(Ordering::Relaxed);
+        if prev == 0 {
+            return; // saturate at 0
+        }
+        let old = self.meter_leases.fetch_sub(1, Ordering::Relaxed);
+        if old == 1 {
+            let _ = self.send(&Request::StopMeter);
+        }
+    }
+
+    pub fn last_meter(&self) -> Option<MeterFrame> {
+        self.last_meter.lock().expect("bridge last_meter mutex poisoned").clone()
     }
 }
 
@@ -213,6 +241,10 @@ fn run_connection(
                 Some(ConnectionState::Connected);
             let _ = app.emit(CONNECTION_EVENT, ConnectionState::Connected);
             connected_emitted = true;
+            // Re-subscribe to meter if any lease is active (tray is always-on).
+            if bridge.meter_leases.load(Ordering::Relaxed) > 0 {
+                let _ = bridge.send(&Request::StartMeter);
+            }
         }
         if matches!(event, Event::Snapshot { .. }) {
             // Cache the full-state event so a webview whose `listen()`
@@ -223,6 +255,18 @@ fn run_connection(
             bridge.last.lock().expect("bridge last-state mutex poisoned").snapshot =
                 Some(event.clone());
         }
+        match &event {
+            Event::Snapshot { health, .. } => {
+                *bridge.last_health_cache.lock().expect("bridge last_health_cache mutex poisoned") = Some(health.clone());
+            }
+            Event::HealthChanged(health) => {
+                *bridge.last_health_cache.lock().expect("bridge last_health_cache mutex poisoned") = Some(health.clone());
+            }
+            Event::MeterFrame(frame) => {
+                *bridge.last_meter.lock().expect("bridge last_meter mutex poisoned") = Some(frame.clone());
+            }
+            _ => {}
+        }
         let _ = app.emit(DAEMON_EVENT, &event);
     }
 
@@ -230,6 +274,8 @@ fn run_connection(
     *bridge.conn.lock().expect("bridge connection mutex poisoned") = None;
     bridge.last.lock().expect("bridge last-state mutex poisoned").connection =
         Some(ConnectionState::Unreachable);
+    *bridge.last_meter.lock().expect("bridge last_meter mutex poisoned") = None;
+    *bridge.last_health_cache.lock().expect("bridge last_health_cache mutex poisoned") = None;
     let _ = app.emit(CONNECTION_EVENT, ConnectionState::Unreachable);
     Ok(())
 }
@@ -281,12 +327,13 @@ pub fn stop_monitor(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String>
 
 #[tauri::command]
 pub fn start_meter(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String> {
-    bridge.send(&Request::StartMeter)
+    bridge.acquire_meter()
 }
 
 #[tauri::command]
 pub fn stop_meter(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String> {
-    bridge.send(&Request::StopMeter)
+    bridge.release_meter();
+    Ok(())
 }
 
 /// A no-connection-yet flag some UIs want at startup — exposed as a
@@ -360,28 +407,16 @@ mod tests {
         assert_eq!(bridge.last_health(), None);
     }
 
-    /// Once the bridge's cache holds an `Event::Snapshot`, `last_health`
-    /// must extract exactly the health verdict it carries -- this is
-    /// the data path U8's tray reads for both `icon_name()` and
-    /// `menu()`, so a regression here would silently break both.
+    /// Once the bridge's `last_health_cache` holds a health value, `last_health`
+    /// must return it — this is the data path U8's tray reads for both
+    /// `icon_name()` and `menu()`, so a regression here would silently break both.
     #[test]
     fn last_health_extracts_health_from_cached_snapshot() {
         let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-3")));
-        *bridge.last.lock().unwrap() = LastState {
-            connection: Some(ConnectionState::Connected),
-            snapshot: Some(Event::Snapshot {
-                devices: vec![engine::DeviceInfo {
-                    id: engine::DeviceId("dev-a".to_string()),
-                    node_id: 1,
-                    description: "Razer".to_string(),
-                }],
-                health: engine::HealthStatus::Linked {
-                    device: engine::DeviceId("dev-a".to_string()),
-                    description: "Razer".to_string(),
-                },
-                config: engine::Config::default(),
-            }),
-        };
+        *bridge.last_health_cache.lock().unwrap() = Some(engine::HealthStatus::Linked {
+            device: engine::DeviceId("dev-a".to_string()),
+            description: "Razer".to_string(),
+        });
         assert_eq!(
             bridge.last_health(),
             Some(engine::HealthStatus::Linked {
@@ -389,5 +424,64 @@ mod tests {
                 description: "Razer".to_string(),
             })
         );
+    }
+
+    /// `acquire_meter` on a fresh bridge increments the lease counter to 1
+    /// (send fails since there's no connection -- that's expected; we only
+    /// care about the counter here).
+    #[test]
+    fn acquire_meter_increments_lease_counter() {
+        let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-4")));
+        // acquire_meter returns Err because send fails with no connection,
+        // but the counter must still be incremented.
+        let _ = bridge.acquire_meter();
+        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 1);
+    }
+
+    /// `release_meter` from count 0 must not panic and must leave the count at 0.
+    #[test]
+    fn release_meter_from_zero_does_not_panic() {
+        let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-5")));
+        bridge.release_meter(); // must not panic
+        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 0);
+    }
+
+    /// `last_meter` returns `None` on a fresh bridge.
+    #[test]
+    fn last_meter_is_none_initially() {
+        let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-6")));
+        assert!(bridge.last_meter().is_none());
+    }
+
+    /// After manually setting `last_meter`, `last_meter()` returns the frame.
+    #[test]
+    fn last_meter_returns_set_frame() {
+        let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-7")));
+        *bridge.last_meter.lock().unwrap() = Some(MeterFrame { rms: 0.5, peak: 0.7 });
+        let frame = bridge.last_meter().expect("should have a frame");
+        assert!((frame.rms - 0.5).abs() < f32::EPSILON);
+        assert!((frame.peak - 0.7).abs() < f32::EPSILON);
+    }
+
+    /// `last_health_cache` returns `None` on a fresh bridge.
+    #[test]
+    fn last_health_cache_is_none_initially() {
+        let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-8")));
+        assert!(bridge.last_health().is_none());
+    }
+
+    /// Two `acquire_meter` calls => lease count 2; one `release_meter` => count 1.
+    #[test]
+    fn acquire_twice_release_once_leaves_count_at_one() {
+        let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-9")));
+        // First acquire: counter goes to 1, send fails (no connection) -- ignored.
+        let _ = bridge.acquire_meter();
+        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 1);
+        // Second acquire: counter goes to 2, send is not called (prev != 0).
+        let _ = bridge.acquire_meter();
+        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 2);
+        // One release: counter drops to 1, StopMeter not sent (old == 2, not 1).
+        bridge.release_meter();
+        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 1);
     }
 }
