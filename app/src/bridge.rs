@@ -74,6 +74,8 @@ pub struct Bridge {
     paths: IpcPaths,
     meter_leases: AtomicUsize,
     last_meter: Mutex<Option<MeterFrame>>,
+    raw_meter_leases: AtomicUsize,
+    last_raw_meter: Mutex<Option<MeterFrame>>,
     last_health_cache: Mutex<Option<engine::HealthStatus>>,
 }
 
@@ -85,6 +87,8 @@ impl Bridge {
             paths,
             meter_leases: AtomicUsize::new(0),
             last_meter: Mutex::new(None),
+            raw_meter_leases: AtomicUsize::new(0),
+            last_raw_meter: Mutex::new(None),
             last_health_cache: Mutex::new(None),
         }
     }
@@ -158,6 +162,34 @@ impl Bridge {
 
     pub fn last_meter(&self) -> Option<MeterFrame> {
         self.last_meter.lock().expect("bridge last_meter mutex poisoned").clone()
+    }
+
+    pub fn acquire_raw_meter(&self) -> Result<(), String> {
+        let prev = self.raw_meter_leases.fetch_add(1, Ordering::Relaxed);
+        if prev == 0 {
+            self.send(&Request::StartRawMeter)?;
+        }
+        Ok(())
+    }
+
+    pub fn release_raw_meter(&self) {
+        let prev = self.raw_meter_leases.load(Ordering::Relaxed);
+        if prev == 0 {
+            return; // saturate at 0
+        }
+        let old = self.raw_meter_leases.fetch_sub(1, Ordering::Relaxed);
+        if old == 1 {
+            let _ = self.send(&Request::StopRawMeter);
+        }
+    }
+
+    /// Cached latest raw frame, mirroring `last_meter`. Currently the panel
+    /// consumes raw frames via the emitted `raw_meter_frame` event stream,
+    /// not this cache; kept for parity with the post-denoise meter and for a
+    /// future Rust-side reader (e.g. a raw-meter tray or a poll command).
+    #[allow(dead_code)]
+    pub fn last_raw_meter(&self) -> Option<MeterFrame> {
+        self.last_raw_meter.lock().expect("bridge last_raw_meter mutex poisoned").clone()
     }
 }
 
@@ -241,9 +273,13 @@ fn run_connection(
                 Some(ConnectionState::Connected);
             let _ = app.emit(CONNECTION_EVENT, ConnectionState::Connected);
             connected_emitted = true;
-            // Re-subscribe to meter if any lease is active (tray is always-on).
+            // Re-subscribe to meters if a lease is active (tray keeps the
+            // post meter always-on; the panel holds a lease on both while open).
             if bridge.meter_leases.load(Ordering::Relaxed) > 0 {
                 let _ = bridge.send(&Request::StartMeter);
+            }
+            if bridge.raw_meter_leases.load(Ordering::Relaxed) > 0 {
+                let _ = bridge.send(&Request::StartRawMeter);
             }
         }
         if matches!(event, Event::Snapshot { .. }) {
@@ -265,6 +301,9 @@ fn run_connection(
             Event::MeterFrame(frame) => {
                 *bridge.last_meter.lock().expect("bridge last_meter mutex poisoned") = Some(frame.clone());
             }
+            Event::RawMeterFrame(frame) => {
+                *bridge.last_raw_meter.lock().expect("bridge last_raw_meter mutex poisoned") = Some(frame.clone());
+            }
             _ => {}
         }
         let _ = app.emit(DAEMON_EVENT, &event);
@@ -275,6 +314,7 @@ fn run_connection(
     bridge.last.lock().expect("bridge last-state mutex poisoned").connection =
         Some(ConnectionState::Unreachable);
     *bridge.last_meter.lock().expect("bridge last_meter mutex poisoned") = None;
+    *bridge.last_raw_meter.lock().expect("bridge last_raw_meter mutex poisoned") = None;
     *bridge.last_health_cache.lock().expect("bridge last_health_cache mutex poisoned") = None;
     let _ = app.emit(CONNECTION_EVENT, ConnectionState::Unreachable);
     Ok(())
@@ -333,6 +373,17 @@ pub fn start_meter(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String> 
 #[tauri::command]
 pub fn stop_meter(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String> {
     bridge.release_meter();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn start_raw_meter(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String> {
+    bridge.acquire_raw_meter()
+}
+
+#[tauri::command]
+pub fn stop_raw_meter(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String> {
+    bridge.release_raw_meter();
     Ok(())
 }
 
@@ -483,5 +534,44 @@ mod tests {
         // One release: counter drops to 1, StopMeter not sent (old == 2, not 1).
         bridge.release_meter();
         assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 1);
+    }
+
+    /// `acquire_raw_meter` on a fresh bridge increments the raw lease to 1.
+    #[test]
+    fn acquire_raw_meter_increments_lease_counter() {
+        let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-10")));
+        let _ = bridge.acquire_raw_meter();
+        assert_eq!(bridge.raw_meter_leases.load(Ordering::Relaxed), 1);
+    }
+
+    /// `release_raw_meter` from count 0 must not panic and stays at 0.
+    #[test]
+    fn release_raw_meter_from_zero_does_not_panic() {
+        let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-11")));
+        bridge.release_raw_meter();
+        assert_eq!(bridge.raw_meter_leases.load(Ordering::Relaxed), 0);
+    }
+
+    /// `last_raw_meter` returns `None` on a fresh bridge, the stored frame after set.
+    #[test]
+    fn last_raw_meter_none_then_set() {
+        let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-12")));
+        assert!(bridge.last_raw_meter().is_none());
+        *bridge.last_raw_meter.lock().expect("test mutex") = Some(MeterFrame { rms: 0.3, peak: 0.4 });
+        let frame = bridge.last_raw_meter().expect("should have a frame");
+        assert!((frame.rms - 0.3).abs() < f32::EPSILON);
+    }
+
+    /// The raw and post meter leases are independent.
+    #[test]
+    fn raw_and_post_meter_leases_are_independent() {
+        let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-13")));
+        let _ = bridge.acquire_meter();
+        let _ = bridge.acquire_raw_meter();
+        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 1);
+        assert_eq!(bridge.raw_meter_leases.load(Ordering::Relaxed), 1);
+        bridge.release_meter();
+        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 0);
+        assert_eq!(bridge.raw_meter_leases.load(Ordering::Relaxed), 1);
     }
 }

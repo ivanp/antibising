@@ -45,6 +45,8 @@ fn main() {
             bridge::stop_monitor,
             bridge::start_meter,
             bridge::stop_meter,
+            bridge::start_raw_meter,
+            bridge::stop_raw_meter,
             bridge::connection_state,
             bridge::pull_state,
         ])
