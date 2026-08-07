@@ -15,7 +15,6 @@
 use antibisingd::ipc::{Event, IpcPaths, Request};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use engine::MeterFrame;
@@ -72,11 +71,24 @@ pub struct Bridge {
     conn: Mutex<Option<Connection>>,
     last: Mutex<LastState>,
     paths: IpcPaths,
-    meter_leases: AtomicUsize,
+    /// Meter lease count, guarded by a mutex so the count mutation and the
+    /// Start/Stop send form one atomic transition. An AtomicUsize is not
+    /// enough: tray spawn (tokio task) and panel commands (Tauri threads)
+    /// acquire concurrently, and a fetch_add/send/fetch_sub rollback on a
+    /// failed send could race a concurrent acquire into a state where the
+    /// count claims a holder but no StartMeter ever succeeded. Holding the
+    /// lock across the whole transition closes that window.
+    meter_leases: Mutex<usize>,
     last_meter: Mutex<Option<MeterFrame>>,
-    raw_meter_leases: AtomicUsize,
+    raw_meter_leases: Mutex<usize>,
     last_raw_meter: Mutex<Option<MeterFrame>>,
     last_health_cache: Mutex<Option<engine::HealthStatus>>,
+    /// Whether the panel currently holds its meter leases, guarded by its
+    /// own mutex so the panel's on-load acquire and on-unload release are a
+    /// single atomic check-and-act. Makes them idempotent across webview
+    /// reloads (double DOMContentLoaded, missed beforeunload on WebKitGTK):
+    /// acquire only when currently inactive, release only when active.
+    panel_meters_active: Mutex<bool>,
 }
 
 impl Bridge {
@@ -85,11 +97,12 @@ impl Bridge {
             conn: Mutex::new(None),
             last: Mutex::new(LastState::default()),
             paths,
-            meter_leases: AtomicUsize::new(0),
+            meter_leases: Mutex::new(0),
             last_meter: Mutex::new(None),
-            raw_meter_leases: AtomicUsize::new(0),
+            raw_meter_leases: Mutex::new(0),
             last_raw_meter: Mutex::new(None),
             last_health_cache: Mutex::new(None),
+            panel_meters_active: Mutex::new(false),
         }
     }
 
@@ -142,20 +155,31 @@ impl Bridge {
     }
 
     pub fn acquire_meter(&self) -> Result<(), String> {
-        let prev = self.meter_leases.fetch_add(1, Ordering::Relaxed);
-        if prev == 0 {
-            self.send(&Request::StartMeter)?;
+        // The lease count is the DESIRED-holder count (who wants metering),
+        // not a wire-subscribed flag. Increment it unconditionally under the
+        // lock so a holder's desire is recorded even if the StartMeter send
+        // fails (daemon unreachable at spawn). The reconnect path resubscribes
+        // whenever the count is > 0, so a transient send failure self-heals
+        // on the next connect instead of stranding the meter until restart.
+        // The lock spans the count change and the send so concurrent
+        // acquires can't interleave a duplicate StartMeter.
+        let mut count = self.meter_leases.lock().expect("bridge meter_leases mutex poisoned");
+        *count += 1;
+        if *count == 1 {
+            // First holder: try to subscribe now. On failure, desire stays
+            // recorded (count == 1) and reconnect will retry.
+            return self.send(&Request::StartMeter);
         }
         Ok(())
     }
 
     pub fn release_meter(&self) {
-        let prev = self.meter_leases.load(Ordering::Relaxed);
-        if prev == 0 {
+        let mut count = self.meter_leases.lock().expect("bridge meter_leases mutex poisoned");
+        if *count == 0 {
             return; // saturate at 0
         }
-        let old = self.meter_leases.fetch_sub(1, Ordering::Relaxed);
-        if old == 1 {
+        *count -= 1;
+        if *count == 0 {
             let _ = self.send(&Request::StopMeter);
         }
     }
@@ -165,20 +189,23 @@ impl Bridge {
     }
 
     pub fn acquire_raw_meter(&self) -> Result<(), String> {
-        let prev = self.raw_meter_leases.fetch_add(1, Ordering::Relaxed);
-        if prev == 0 {
-            self.send(&Request::StartRawMeter)?;
+        // Desire-count semantics, same as acquire_meter — a failed initial
+        // send leaves the count recorded so reconnect resubscribes.
+        let mut count = self.raw_meter_leases.lock().expect("bridge raw_meter_leases mutex poisoned");
+        *count += 1;
+        if *count == 1 {
+            return self.send(&Request::StartRawMeter);
         }
         Ok(())
     }
 
     pub fn release_raw_meter(&self) {
-        let prev = self.raw_meter_leases.load(Ordering::Relaxed);
-        if prev == 0 {
+        let mut count = self.raw_meter_leases.lock().expect("bridge raw_meter_leases mutex poisoned");
+        if *count == 0 {
             return; // saturate at 0
         }
-        let old = self.raw_meter_leases.fetch_sub(1, Ordering::Relaxed);
-        if old == 1 {
+        *count -= 1;
+        if *count == 0 {
             let _ = self.send(&Request::StopRawMeter);
         }
     }
@@ -190,6 +217,52 @@ impl Bridge {
     #[allow(dead_code)]
     pub fn last_raw_meter(&self) -> Option<MeterFrame> {
         self.last_raw_meter.lock().expect("bridge last_raw_meter mutex poisoned").clone()
+    }
+
+    /// Idempotently acquire both meter leases for the panel. A no-op if the
+    /// panel already holds them (webview reload firing DOMContentLoaded
+    /// twice, or a second panel window). The `panel_meters_active` lock is
+    /// held across the check AND both acquisitions, so this is atomic against
+    /// a concurrent `panel_meters_off`.
+    ///
+    /// Paired, deferred-success contract: both `acquire_meter` and
+    /// `acquire_raw_meter` run unconditionally (no `?` short-circuit), so the
+    /// panel always claims exactly one desired hold on EACH meter — even when
+    /// the daemon is unreachable and the initial Start send fails. The desire
+    /// counts stay recorded and the reconnect path resubscribes both whenever
+    /// their count is > 0. `active` is set true once the pair is claimed so
+    /// `panel_meters_off` releases exactly this pair and a reload never
+    /// re-claims. Any send error is aggregated and returned for logging only.
+    pub fn panel_meters_on(&self) -> Result<(), String> {
+        let mut active = self
+            .panel_meters_active
+            .lock()
+            .expect("bridge panel_meters_active mutex poisoned");
+        if *active {
+            return Ok(()); // Already active — idempotent no-op.
+        }
+        *active = true; // Claim ownership before acquiring the pair.
+        let post = self.acquire_meter();
+        let raw = self.acquire_raw_meter();
+        post.and(raw)
+    }
+
+    /// Idempotently release both panel meter leases. A no-op if the panel
+    /// doesn't currently hold them (a stray beforeunload, or a release after
+    /// the leases were never acquired). Exactly one release per prior
+    /// `panel_meters_on`, so a reload that both misses beforeunload AND
+    /// re-runs on-load never accumulates, and a double-fire never
+    /// double-decrements.
+    pub fn panel_meters_off(&self) {
+        let mut active = self
+            .panel_meters_active
+            .lock()
+            .expect("bridge panel_meters_active mutex poisoned");
+        if *active {
+            self.release_meter();
+            self.release_raw_meter();
+            *active = false;
+        }
     }
 }
 
@@ -273,12 +346,14 @@ fn run_connection(
                 Some(ConnectionState::Connected);
             let _ = app.emit(CONNECTION_EVENT, ConnectionState::Connected);
             connected_emitted = true;
-            // Re-subscribe to meters if a lease is active (tray keeps the
-            // post meter always-on; the panel holds a lease on both while open).
-            if bridge.meter_leases.load(Ordering::Relaxed) > 0 {
+            // Re-subscribe to meters if a desired lease exists (tray keeps
+            // the post meter always-on; the panel holds both while open).
+            // A hold whose initial Start send failed while the daemon was
+            // down is recorded as a count > 0, so it resubscribes here.
+            if *bridge.meter_leases.lock().expect("bridge meter_leases mutex poisoned") > 0 {
                 let _ = bridge.send(&Request::StartMeter);
             }
-            if bridge.raw_meter_leases.load(Ordering::Relaxed) > 0 {
+            if *bridge.raw_meter_leases.lock().expect("bridge raw_meter_leases mutex poisoned") > 0 {
                 let _ = bridge.send(&Request::StartRawMeter);
             }
         }
@@ -365,25 +440,20 @@ pub fn stop_monitor(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String>
     bridge.send(&Request::StopMonitor)
 }
 
+/// Panel meter subscription — idempotent acquire of BOTH meters (post +
+/// raw). Safe to call on every panel load; a webview reload that re-fires
+/// this never accumulates leases (see `panel_meters_on`).
 #[tauri::command]
-pub fn start_meter(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String> {
-    bridge.acquire_meter()
+pub fn panel_meters_on(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String> {
+    bridge.panel_meters_on()
 }
 
+/// Panel meter teardown — idempotent release of both panel meter leases.
+/// Safe to call on `beforeunload`; a missed or duplicated call cannot
+/// corrupt the lease count (see `panel_meters_off`).
 #[tauri::command]
-pub fn stop_meter(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String> {
-    bridge.release_meter();
-    Ok(())
-}
-
-#[tauri::command]
-pub fn start_raw_meter(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String> {
-    bridge.acquire_raw_meter()
-}
-
-#[tauri::command]
-pub fn stop_raw_meter(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String> {
-    bridge.release_raw_meter();
+pub fn panel_meters_off(bridge: tauri::State<'_, Arc<Bridge>>) -> Result<(), String> {
+    bridge.panel_meters_off();
     Ok(())
 }
 
@@ -486,7 +556,7 @@ mod tests {
         // acquire_meter returns Err because send fails with no connection,
         // but the counter must still be incremented.
         let _ = bridge.acquire_meter();
-        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 1);
+        assert_eq!(*bridge.meter_leases.lock().expect("test mutex"), 1);
     }
 
     /// `release_meter` from count 0 must not panic and must leave the count at 0.
@@ -494,7 +564,7 @@ mod tests {
     fn release_meter_from_zero_does_not_panic() {
         let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-5")));
         bridge.release_meter(); // must not panic
-        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 0);
+        assert_eq!(*bridge.meter_leases.lock().expect("test mutex"), 0);
     }
 
     /// `last_meter` returns `None` on a fresh bridge.
@@ -527,13 +597,13 @@ mod tests {
         let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-9")));
         // First acquire: counter goes to 1, send fails (no connection) -- ignored.
         let _ = bridge.acquire_meter();
-        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 1);
+        assert_eq!(*bridge.meter_leases.lock().expect("test mutex"), 1);
         // Second acquire: counter goes to 2, send is not called (prev != 0).
         let _ = bridge.acquire_meter();
-        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 2);
+        assert_eq!(*bridge.meter_leases.lock().expect("test mutex"), 2);
         // One release: counter drops to 1, StopMeter not sent (old == 2, not 1).
         bridge.release_meter();
-        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 1);
+        assert_eq!(*bridge.meter_leases.lock().expect("test mutex"), 1);
     }
 
     /// `acquire_raw_meter` on a fresh bridge increments the raw lease to 1.
@@ -541,7 +611,7 @@ mod tests {
     fn acquire_raw_meter_increments_lease_counter() {
         let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-10")));
         let _ = bridge.acquire_raw_meter();
-        assert_eq!(bridge.raw_meter_leases.load(Ordering::Relaxed), 1);
+        assert_eq!(*bridge.raw_meter_leases.lock().expect("test mutex"), 1);
     }
 
     /// `release_raw_meter` from count 0 must not panic and stays at 0.
@@ -549,7 +619,7 @@ mod tests {
     fn release_raw_meter_from_zero_does_not_panic() {
         let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-11")));
         bridge.release_raw_meter();
-        assert_eq!(bridge.raw_meter_leases.load(Ordering::Relaxed), 0);
+        assert_eq!(*bridge.raw_meter_leases.lock().expect("test mutex"), 0);
     }
 
     /// `last_raw_meter` returns `None` on a fresh bridge, the stored frame after set.
@@ -568,10 +638,26 @@ mod tests {
         let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-13")));
         let _ = bridge.acquire_meter();
         let _ = bridge.acquire_raw_meter();
-        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 1);
-        assert_eq!(bridge.raw_meter_leases.load(Ordering::Relaxed), 1);
+        assert_eq!(*bridge.meter_leases.lock().expect("test mutex"), 1);
+        assert_eq!(*bridge.raw_meter_leases.lock().expect("test mutex"), 1);
         bridge.release_meter();
-        assert_eq!(bridge.meter_leases.load(Ordering::Relaxed), 0);
-        assert_eq!(bridge.raw_meter_leases.load(Ordering::Relaxed), 1);
+        assert_eq!(*bridge.meter_leases.lock().expect("test mutex"), 0);
+        assert_eq!(*bridge.raw_meter_leases.lock().expect("test mutex"), 1);
+    }
+
+    /// `panel_meters_on` is idempotent: two calls claim the pair exactly
+    /// once, and `panel_meters_off` releases exactly that pair. A second
+    /// on/off round is a no-op, so a webview reload can't accumulate leases.
+    #[test]
+    fn panel_meters_on_off_is_idempotent() {
+        let bridge = Bridge::new(IpcPaths::at(std::env::temp_dir().join("antibising-bridge-test-unused-14")));
+        let _ = bridge.panel_meters_on();
+        let _ = bridge.panel_meters_on(); // reload re-fires — must not double-count
+        assert_eq!(*bridge.meter_leases.lock().expect("test mutex"), 1);
+        assert_eq!(*bridge.raw_meter_leases.lock().expect("test mutex"), 1);
+        bridge.panel_meters_off();
+        bridge.panel_meters_off(); // duplicate — must not underflow
+        assert_eq!(*bridge.meter_leases.lock().expect("test mutex"), 0);
+        assert_eq!(*bridge.raw_meter_leases.lock().expect("test mutex"), 0);
     }
 }

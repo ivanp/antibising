@@ -440,21 +440,18 @@
           console.error('pull_state failed', e);
         }
         invoke('request_snapshot').catch((e) => console.error('request_snapshot failed', e));
-        // Subscribe to both meters so the dual comparison animates whenever
-        // the panel is open (U5/R6). The tray keeps the post meter always-on,
-        // but the panel takes its own leases so the raw meter runs too.
-        invoke('start_meter').catch((e) => console.error('start_meter failed', e));
-        invoke('start_raw_meter').catch((e) => console.error('start_raw_meter failed', e));
+        // Subscribe to both meters (post + raw) so the dual comparison
+        // animates whenever the panel is open (U5/R6). panel_meters_on is
+        // idempotent — a webview reload re-firing this never accumulates
+        // leases. The tray keeps the post meter always-on independently.
+        invoke('panel_meters_on').catch((e) => console.error('panel_meters_on failed', e));
       });
 
-      // Release both meter leases when the panel closes or reloads, so the
-      // refcount returns to its baseline. Without this, every webview reload
-      // increments the leases permanently and the raw capture would survive
-      // after the panel is gone (the post meter's tray baseline keeps it at
-      // >=1, but the raw meter would leak).
+      // Release the panel's meter leases on close/reload. panel_meters_off
+      // is idempotent, so a missed or duplicated beforeunload can't corrupt
+      // the lease count (the Rust side holds panel-ownership state).
       window.addEventListener('beforeunload', () => {
-        invoke('stop_meter').catch(() => {});
-        invoke('stop_raw_meter').catch(() => {});
+        invoke('panel_meters_off').catch(() => {});
       });
     </script>
   </body>

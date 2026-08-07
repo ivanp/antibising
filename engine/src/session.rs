@@ -399,9 +399,26 @@ impl Generation {
     /// registry global event would otherwise wake it.
     fn has_pending_meter_convergence(&self) -> bool {
         let post_pending = self.meter_sessions.values().any(|s| {
-            // Unresolved node id, or resolved but not yet linked while a
-            // post-denoise source exists to link to.
-            s.node_id.is_none() || (s.links.is_empty() && self.source_node_id.is_some())
+            // Unresolved node id always re-arms (poll stream.node_id()).
+            // Otherwise re-arm only when a source node AND its output ports
+            // are recorded but the link isn't made yet — the convergeable
+            // state. If the source node is present but portless (transient
+            // or pathological), don't spin at 50Hz: the port's own registry
+            // global arrival will re-mark dirty when it appears.
+            if s.node_id.is_none() {
+                return true;
+            }
+            if !s.links.is_empty() {
+                return false;
+            }
+            match self.source_node_id {
+                Some(src) => self
+                    .device_output_ports
+                    .get(&src)
+                    .map(|p| !p.is_empty())
+                    .unwrap_or(false),
+                None => false,
+            }
         });
         // Raw sessions only re-arm on an unresolved node id. Once node_id
         // resolves, linking is gated on a device being connected — an
@@ -555,8 +572,18 @@ impl Generation {
         // retained link proxies for any session whose source node or own
         // meter node owned this port, so the dedup guard doesn't block a
         // rebuild after PipeWire tears the underlying link down.
+        let source_node_id = self.source_node_id;
         for s in self.meter_sessions.values_mut() {
-            if s.node_id == Some(node_id) || s.linked_source_node_id == Some(node_id) {
+            // The post-meter path links from the fixed source node and never
+            // sets linked_source_node_id, so match source_node_id directly —
+            // otherwise a source *port* departing while the source *node*
+            // survives (filter-chain format renegotiation) leaves a stale
+            // link the dedup guard never rebuilds, killing the post meter
+            // (and the tray icon it feeds) until the app restarts.
+            if s.node_id == Some(node_id)
+                || s.linked_source_node_id == Some(node_id)
+                || source_node_id == Some(node_id)
+            {
                 s.links.clear();
                 s.linked_source_node_id = None;
             }
