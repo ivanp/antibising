@@ -69,9 +69,9 @@ Persisted at `~/.config/antibising/config.toml`. Managed through the UI or manua
 | Key | Type | Description |
 |---|---|---|
 | `preference_order` | `[string]` | Ordered list of preferred input device names |
-| `pin` | `string | null` | Pinned input device name (overrides auto-selection) |
+| `pin` | `string \| null` | Pinned input device name (overrides auto-selection) |
 | `denoise_enabled` | `bool` | Whether RNNoise suppression is active |
-| `vad_threshold` | `float` | Voice-activity detection threshold percentage (0.0 – 100.0) |
+| `vad_threshold` | `float` | Voice-activity detection threshold percentage (0.0 – 99.0) |
 | `dry_mix` | `float` | Dry signal mix ratio; `1.0` bypasses RNNoise entirely |
 
 ## Architecture
