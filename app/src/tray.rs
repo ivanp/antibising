@@ -29,6 +29,12 @@ const MIC_SIZE: i32 = 22;
 
 const WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
 const GREEN: [u8; 4] = [0xFF, 0x00, 0xCC, 0x44];
+/// Denoise-on indicator: cyan. Painted as a 4×4 filled square in the
+/// top-left corner of the icon (rows 0–3, cols 0–3 — empty space above
+/// the mic body which starts at row 2, so the marker never overlaps the
+/// microphone silhouette). Distinct hue from GREEN so it reads as a
+/// separate "filtering active" signal, not an audio-level fill.
+const DENOISE_ON: [u8; 4] = [0xFF, 0x00, 0xC8, 0xFF];
 
 fn is_mic_shape(x: i32, y: i32) -> bool {
     // Top cap (semicircle approximation)
@@ -49,20 +55,20 @@ fn is_mic_shape(x: i32, y: i32) -> bool {
     false
 }
 
-fn render_icon(level: f32) -> Vec<u8> {
+fn render_icon(level: f32, denoise: bool) -> Vec<u8> {
     let size = MIC_SIZE;
     let mut buf = vec![0u8; (size * size * 4) as usize];
     let clamped = level.clamp(0.0, 1.0);
 
-    // The mic body (the fillable region) spans rows BODY_TOP..=BODY_BOTTOM.
+    // mic body (the fillable region) spans rows BODY_TOP..=BODY_BOTTOM.
     // Cradle, stem, and base (rows 14–18) are structural and stay white.
     const BODY_TOP: i32 = 2;
     const BODY_BOTTOM: i32 = 13;
     const BODY_HEIGHT: i32 = BODY_BOTTOM - BODY_TOP + 1; // 12 rows
 
-    // fill_row: rows at-and-below this get green (within the body).
-    // level 0.0 → fill_row = BODY_BOTTOM + 1 (nothing filled)
-    // level 1.0 → fill_row = BODY_TOP (everything filled)
+    // fill_row: rows at-and-below get green (within the body).
+    // level 0.0 -> fill_row = BODY_BOTTOM+1 (nothing filled)
+    // level 1.0 -> fill_row = BODY_TOP (everything filled)
     let fill_row = BODY_BOTTOM + 1 - (clamped * BODY_HEIGHT as f32) as i32;
 
     for y in 0..size {
@@ -70,7 +76,7 @@ fn render_icon(level: f32) -> Vec<u8> {
             if is_mic_shape(x, y) {
                 let offset = ((y * size + x) * 4) as usize;
                 // Green fill only in the body region (rows 2–13).
-                let color = if y >= fill_row && y <= BODY_BOTTOM {
+                let color = if fill_row <= y && y <= BODY_BOTTOM {
                     GREEN
                 } else {
                     WHITE
@@ -79,6 +85,17 @@ fn render_icon(level: f32) -> Vec<u8> {
             }
         }
     }
+
+    // Denoise-on marker: 4×4 cyan square in the top-left corner.
+    if denoise {
+        for y in 0..4 {
+            for x in 0..4 {
+                let offset = ((y * size + x) * 4) as usize;
+                buf[offset..offset + 4].copy_from_slice(&DENOISE_ON);
+            }
+        }
+    }
+
     buf
 }
 
@@ -127,16 +144,21 @@ impl Tray for AntibisingTray {
         }
     }
 
-    /// Custom pixmap for the level meter (KTD4). When Linked, returns
-    /// the microphone silhouette with green fill proportional to
-    /// `smoothed_level`. Non-Linked states return an empty vec so
-    /// waybar uses `icon_name()` instead.
+    /// Custom pixmap level meter (KTD4). When Linked, returns a
+    /// microphone silhouette with green fill proportional to
+    /// `smoothed_level`, plus a cyan denoise-on marker in the top-left
+    /// corner when denoise is active. Non-Linked states return empty vec
+    /// so waybar uses `icon_name()` instead. The denoise state is read
+    /// live from the bridge snapshot every property fetch, so toggling
+    /// denoise is reflected on the next update tick (no extra push
+    /// needed — ksni's `PropertiesMonitor` hashes `icon_pixmap()` and
+    /// `handle.update()` emits `NewIcon` on diff).
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         if matches!(self.bridge.last_health(), Some(HealthStatus::Linked { .. })) {
             vec![ksni::Icon {
                 width: MIC_SIZE,
                 height: MIC_SIZE,
-                data: render_icon(self.smoothed_level),
+                data: render_icon(self.smoothed_level, self.denoise_on()),
             }]
         } else {
             vec![]
@@ -242,8 +264,10 @@ impl Tray for AntibisingTray {
         items.push(MenuItem::Separator);
 
         // Denoise toggle: identical Dry-Mix semantics to the panel's own
-        // button (R6 -- toggling never touches source identity).
-        let denoise_on = config.denoise_enabled && config.dry_mix < 1.0;
+        // button (R6 -- toggling never touches source identity). Reads the
+        // same `denoise_on()` helper as `icon_pixmap()` (single source of
+        // truth), then binds into the move closure.
+        let denoise_on = self.denoise_on();
         items.push(
             CheckmarkItem {
                 label: "Denoise".into(),
@@ -288,6 +312,22 @@ impl Tray for AntibisingTray {
     /// waybar stays blank after restart.
     fn watcher_online(&self) {
         self.force_icon_refresh.store(true, Ordering::Relaxed);
+    }
+}
+
+impl AntibisingTray {
+    /// Whether denoise is actively suppressing. Same predicate the panel
+    /// button and tray menu checkmark use (`denoise_enabled && dry_mix < 1.0`,
+    /// R6 — toggling never touches source identity). Reads the live bridge
+    /// snapshot so it tracks daemon-side state, not a stale local copy.
+    /// Single source of truth shared by `icon_pixmap()` and `menu()`.
+    fn denoise_on(&self) -> bool {
+        match self.bridge.last_snapshot() {
+            Some(Event::Snapshot { config, .. }) => {
+                config.denoise_enabled && config.dry_mix < 1.0
+            }
+            _ => false,
+        }
     }
 }
 
@@ -387,26 +427,26 @@ mod tests {
 
     #[test]
     fn render_icon_output_size() {
-        let buf = render_icon(0.0);
+        let buf = render_icon(0.0, false);
         assert_eq!(buf.len(), (MIC_SIZE * MIC_SIZE * 4) as usize);
     }
 
     #[test]
     fn render_icon_zero_has_no_green() {
-        let buf = render_icon(0.0);
+        let buf = render_icon(0.0, false);
         for y in 0..MIC_SIZE {
             for x in 0..MIC_SIZE {
                 let off = ((y * MIC_SIZE + x) * 4) as usize;
                 let pixel = &buf[off..off + 4];
-                assert_ne!(pixel, &GREEN, "green pixel found at ({x}, {y}) with level 0.0");
+                assert_ne!(pixel, &GREEN, "green pixel found at ({x}, {y}) level 0.0");
             }
         }
     }
 
     #[test]
     fn render_icon_full_body_is_all_green() {
-        let buf = render_icon(1.0);
-        // Body pixels (rows 2–13) should all be green at level 1.0.
+        let buf = render_icon(1.0, false);
+        // Body pixels (rows 2–13) all green at level 1.0.
         // Structural pixels (cradle/stem/base, rows 14–18) stay white.
         for y in 0..MIC_SIZE {
             for x in 0..MIC_SIZE {
@@ -414,9 +454,9 @@ mod tests {
                     let off = ((y * MIC_SIZE + x) * 4) as usize;
                     let pixel = &buf[off..off + 4];
                     if y <= 13 {
-                        assert_eq!(pixel, &GREEN, "body pixel at ({x}, {y}) should be green at level 1.0");
+                        assert_eq!(pixel, &GREEN, "body pixel at ({x}, {y}) green level 1.0");
                     } else {
-                        assert_eq!(pixel, &WHITE, "structural pixel at ({x}, {y}) should be white at level 1.0");
+                        assert_eq!(pixel, &WHITE, "structural pixel at ({x}, {y}) white level 1.0");
                     }
                 }
             }
@@ -425,7 +465,7 @@ mod tests {
 
     #[test]
     fn render_icon_half_has_both_colors() {
-        let buf = render_icon(0.5);
+        let buf = render_icon(0.5, false);
         let mut has_green = false;
         let mut has_white = false;
         for y in 0..MIC_SIZE {
@@ -433,23 +473,81 @@ mod tests {
                 if is_mic_shape(x, y) {
                     let off = ((y * MIC_SIZE + x) * 4) as usize;
                     let pixel = &buf[off..off + 4];
-                    if pixel == &GREEN { has_green = true; }
-                    if pixel == &WHITE { has_white = true; }
+                    if pixel == &GREEN {
+                        has_green = true;
+                    }
+                    if pixel == &WHITE {
+                        has_white = true;
+                    }
                 }
             }
         }
-        assert!(has_green, "no green pixels at level 0.5");
-        assert!(has_white, "no white pixels at level 0.5");
+        assert!(has_green, "no green pixels level 0.5");
+        assert!(has_white, "no white pixels level 0.5");
     }
 
     #[test]
     fn render_icon_non_shape_pixels_transparent() {
-        let buf = render_icon(0.5);
+        let buf = render_icon(0.5, false);
         for y in 0..MIC_SIZE {
             for x in 0..MIC_SIZE {
                 if !is_mic_shape(x, y) {
                     let off = ((y * MIC_SIZE + x) * 4) as usize;
-                    assert_eq!(buf[off], 0x00, "non-shape pixel at ({x}, {y}) has non-zero alpha");
+                    assert_eq!(buf[off], 0x00, "non-shape pixel at ({x}, {y}) non-zero alpha");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_icon_denoise_off_has_no_marker() {
+        // Denoise off: the top-left 4×4 marker region stays transparent.
+        let buf = render_icon(0.5, false);
+        for y in 0..4 {
+            for x in 0..4 {
+                let off = ((y * MIC_SIZE + x) * 4) as usize;
+                assert_eq!(buf[off..off + 4], [0x00, 0x00, 0x00, 0x00], "marker pixel at ({x}, {y}) non-transparent with denoise off");
+            }
+        }
+    }
+
+    #[test]
+    fn render_icon_denoise_on_paints_marker() {
+        // Denoise on: the top-left 4×4 marker region is DENOISE_ON cyan.
+        let buf = render_icon(0.5, true);
+        for y in 0..4 {
+            for x in 0..4 {
+                let off = ((y * MIC_SIZE + x) * 4) as usize;
+                assert_eq!(buf[off..off + 4], DENOISE_ON, "marker pixel at ({x}, {y}) not cyan with denoise on");
+            }
+        }
+    }
+
+    #[test]
+    fn render_icon_denoise_marker_outside_mic_shape() {
+        // The 4×4 marker region (rows 0–3, cols 0–3) must never overlap the
+        // mic silhouette — otherwise the marker would paint over the mic.
+        for y in 0..4 {
+            for x in 0..4 {
+                assert!(!is_mic_shape(x, y), "marker cell ({x}, {y}) overlaps mic shape");
+            }
+        }
+    }
+
+    #[test]
+    fn render_icon_denoise_off_vs_on_differ() {
+        // The only difference between denoise-off and denoise-on must be
+        // the 4×4 top-left marker: the rest of the icon is identical.
+        let off = render_icon(0.5, false);
+        let on = render_icon(0.5, true);
+        for y in 0..MIC_SIZE {
+            for x in 0..MIC_SIZE {
+                let o = ((y * MIC_SIZE + x) * 4) as usize;
+                let in_marker = y < 4 && x < 4;
+                if in_marker {
+                    assert_ne!(off[o..o + 4], on[o..o + 4], "marker pixel ({x}, {y}) should differ");
+                } else {
+                    assert_eq!(off[o..o + 4], on[o..o + 4], "non-marker pixel ({x}, {y}) should not differ");
                 }
             }
         }
