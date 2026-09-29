@@ -127,6 +127,14 @@ fn cmd_run() {
             pin.clone(),
         ))));
     }
+    let _ = session.send(engine::SessionCommand::SetRnnoiseParam(
+        engine::RnnoiseParam::DryMix,
+        config.dry_mix as f32,
+    ));
+    let _ = session.send(engine::SessionCommand::SetRnnoiseParam(
+        engine::RnnoiseParam::VadThreshold,
+        config.vad_threshold as f32,
+    ));
 
     let ipc_paths = IpcPaths::production();
     let (_lock_file, listener) = match bind_singleton(&ipc_paths) {

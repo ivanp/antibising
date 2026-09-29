@@ -197,6 +197,36 @@ impl Drop for Session {
     }
 }
 
+/// Routing/RNNoise policy carried by `run_loop` across `Generation`
+/// rebuilds. A `Generation` is rebuilt from scratch on every PipeWire
+/// (re)connect (see the doc comment below), which used to silently drop
+/// `pin`/`preference_order`/`dry_mix`/`vad_threshold` — the daemon only
+/// ever sends `SetPreferenceOrder`/`SetPin`/`SetRnnoiseParam` once at
+/// startup, so any later reconnect left the new generation with no
+/// routing policy at all (`compute_desired_feed` -> `DesiredFeed::None`
+/// -> capture links destroyed -> `SilentNoDevice`). `run_loop` owns one
+/// `LoopPolicy` for the life of the thread, updates it whenever one of
+/// those four commands arrives, and seeds every new `Generation` from it.
+#[derive(Debug, Clone, Default)]
+struct LoopPolicy {
+    preference_order: Vec<DeviceId>,
+    pin: Option<DeviceId>,
+    dry_mix: f32,
+    vad_threshold: f32,
+}
+
+impl LoopPolicy {
+    /// Same defaults `Generation::new()` used to hardcode inline.
+    fn new() -> Self {
+        Self {
+            preference_order: Vec::new(),
+            pin: None,
+            dry_mix: crate::fragment::FragmentConfig::default().dry_mix as f32,
+            vad_threshold: crate::fragment::FragmentConfig::default().vad_threshold as f32,
+        }
+    }
+}
+
 /// Per-generation state rebuilt on every (re)connect. Never patched across a
 /// reconnect — recovery is a clean rebuild, not an attempt to reconcile
 /// stale IDs with new ones.
@@ -236,6 +266,8 @@ struct Generation {
     /// Routing policy state (R3), set via `SessionCommand`.
     preference_order: Vec<DeviceId>,
     pin: Option<DeviceId>,
+    dry_mix: f32,
+    vad_threshold: f32,
     /// The last [`crate::model::HealthStatus`] emitted this generation
     /// (`None` before the first `reconcile_now` cycle). Dedup state for
     /// `HealthChanged` — U10's IPC clients need change events, not a
@@ -364,7 +396,16 @@ struct MeterSession {
 }
 
 impl Generation {
+    /// Test-only convenience: build a `Generation` with default policy
+    /// (no pin, empty preference order, fragment defaults for RNNoise).
+    /// Production code always goes through `with_policy` so a rebuilt
+    /// generation inherits whatever `run_loop`'s `LoopPolicy` holds.
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_policy(&LoopPolicy::new())
+    }
+
+    fn with_policy(policy: &LoopPolicy) -> Self {
         Self {
             devices: HashMap::new(),
             device_identities: HashMap::new(),
@@ -374,8 +415,10 @@ impl Generation {
             capture_node_proxy: None,
             capture_input_ports: Vec::new(),
             capture_links: HashMap::new(),
-            preference_order: Vec::new(),
-            pin: None,
+            preference_order: policy.preference_order.clone(),
+            pin: policy.pin.clone(),
+            dry_mix: policy.dry_mix,
+            vad_threshold: policy.vad_threshold,
             last_health: None,
             source_node_id: None,
             source_output_ports: Vec::new(),
@@ -1198,6 +1241,35 @@ mod generation_tests {
             && same_linked != Some(desired_device_node);
         assert!(!is_stale_same, "links from same device should not be purged");
     }
+
+    #[test]
+    fn policy_survives_generation_rebuild() {
+        // LoopPolicy must carry pin + preference_order + RNNoise params
+        // across generation boundaries: this is the actual fix for the
+        // mic-activation-persistence bug — Generation::new() used to
+        // reset all four fields to defaults on every PipeWire reconnect,
+        // silently dropping routing policy the daemon only ever sends
+        // once at startup.
+        let order = vec![DeviceId("test_device".to_string())];
+        let pin = Some(DeviceId("test_device".to_string()));
+        let policy = LoopPolicy {
+            preference_order: order.clone(),
+            pin: pin.clone(),
+            dry_mix: 0.5,
+            vad_threshold: 42.0,
+        };
+        let gen = Generation::with_policy(&policy);
+        assert_eq!(gen.preference_order, order);
+        assert_eq!(gen.pin, pin);
+        assert_eq!(gen.dry_mix, 0.5);
+        assert_eq!(gen.vad_threshold, 42.0);
+
+        // A second generation built from the same policy (simulating a
+        // second rebuild) still carries it — policy is not consumed.
+        let gen2 = Generation::with_policy(&policy);
+        assert_eq!(gen2.preference_order, order);
+        assert_eq!(gen2.pin, pin);
+    }
 }
 
 enum GenerationOutcome {
@@ -1220,9 +1292,13 @@ fn run_loop(
     const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
     let mut cmd_rx = cmd_rx;
+    let mut policy = LoopPolicy::new();
     loop {
         let outcome;
-        (outcome, cmd_rx) = run_one_generation(&our_source_name, cmd_rx, &event_tx);
+        let returned_policy;
+        (outcome, cmd_rx, returned_policy) =
+            run_one_generation(&our_source_name, cmd_rx, &event_tx, policy);
+        policy = returned_policy;
         match outcome {
             GenerationOutcome::Disconnected => {
                 let _ = event_tx.send(SessionEvent::Disconnected);
@@ -1244,25 +1320,31 @@ fn run_one_generation(
     our_source_name: &str,
     cmd_rx: StdReceiver<SessionCommand>,
     event_tx: &StdSender<SessionEvent>,
-) -> (GenerationOutcome, StdReceiver<SessionCommand>) {
+    policy: LoopPolicy,
+) -> (GenerationOutcome, StdReceiver<SessionCommand>, LoopPolicy) {
     let mainloop = match MainLoopRc::new(None) {
         Ok(m) => m,
-        Err(_) => return (GenerationOutcome::ConnectFailed, cmd_rx),
+        Err(_) => return (GenerationOutcome::ConnectFailed, cmd_rx, policy),
     };
     let context = match ContextRc::new(&mainloop, None) {
         Ok(c) => c,
-        Err(_) => return (GenerationOutcome::ConnectFailed, cmd_rx),
+        Err(_) => return (GenerationOutcome::ConnectFailed, cmd_rx, policy),
     };
     let core: CoreRc = match context.connect_rc(None) {
         Ok(c) => c,
-        Err(_) => return (GenerationOutcome::ConnectFailed, cmd_rx),
+        Err(_) => return (GenerationOutcome::ConnectFailed, cmd_rx, policy),
     };
     let registry: RegistryRc = match core.get_registry_rc() {
         Ok(r) => r,
-        Err(_) => return (GenerationOutcome::ConnectFailed, cmd_rx),
+        Err(_) => return (GenerationOutcome::ConnectFailed, cmd_rx, policy),
     };
 
-    let generation = Rc::new(RefCell::new(Generation::new()));
+    let generation = Rc::new(RefCell::new(Generation::with_policy(&policy)));
+    // Carries policy updates (`SetPreferenceOrder`/`SetPin`/
+    // `SetRnnoiseParam`) forward to the *next* generation. `Generation`
+    // itself is rebuilt from scratch on every reconnect, so this is the
+    // only thing that survives a rebuild.
+    let policy_cell = Rc::new(RefCell::new(policy));
     let disconnected = Rc::new(Cell::new(false));
 
     // Core error listener: any error callback with id == 0 (the core
@@ -1272,10 +1354,13 @@ fn run_one_generation(
     let ml_quit = mainloop.clone();
     let _core_listener = core
         .add_listener_local()
-        .error(move |id, _seq, _res, _msg| {
+        .error(move |id, seq, res, msg| {
             if id == 0 {
+                tracing::warn!(id, seq, res, msg = %msg, "core error — triggering rebuild");
                 disc_flag.set(true);
                 ml_quit.quit();
+            } else {
+                tracing::debug!(id, seq, res, msg = %msg, "core error (non-fatal, ignored)");
             }
         })
         .register();
@@ -1365,6 +1450,7 @@ fn run_one_generation(
     let ml_for_timer = mainloop.clone();
     let core_for_timer = core.clone();
     let gen_for_timer = generation.clone();
+    let policy_for_timer = policy_cell.clone();
     let link_factory_for_timer = link_factory_for_global.clone();
     let dirty_for_timer = dirty_for_global.clone();
     let dirty_for_timer2 = dirty_for_remove.clone();
@@ -1410,17 +1496,34 @@ fn run_one_generation(
                     let _ = core_for_timer.sync(0);
                 }
                 Ok(SessionCommand::SetPreferenceOrder(order)) => {
+                    policy_for_timer.borrow_mut().preference_order = order.clone();
                     let mut gen = gen_for_timer.borrow_mut();
                     gen.preference_order = order;
                     reconcile_now(&mut gen, &core_for_timer, &link_factory_for_timer, &tx_for_timer);
                 }
                 Ok(SessionCommand::SetPin(pin)) => {
+                    policy_for_timer.borrow_mut().pin = pin.clone();
                     let mut gen = gen_for_timer.borrow_mut();
                     gen.pin = pin;
                     reconcile_now(&mut gen, &core_for_timer, &link_factory_for_timer, &tx_for_timer);
                 }
                 Ok(SessionCommand::SetRnnoiseParam(param, value)) => {
-                    gen_for_timer.borrow().set_rnnoise_param(param, value);
+                    match param {
+                        crate::params::RnnoiseParam::DryMix => {
+                            policy_for_timer.borrow_mut().dry_mix = value;
+                        }
+                        crate::params::RnnoiseParam::VadThreshold => {
+                            policy_for_timer.borrow_mut().vad_threshold = value;
+                        }
+                        _ => {}
+                    }
+                    let mut gen = gen_for_timer.borrow_mut();
+                    match param {
+                        crate::params::RnnoiseParam::DryMix => gen.dry_mix = value,
+                        crate::params::RnnoiseParam::VadThreshold => gen.vad_threshold = value,
+                        _ => {}
+                    }
+                    gen.set_rnnoise_param(param, value);
                 }
                 Ok(SessionCommand::StartMonitor(session_id)) => {
                     let mut gen = gen_for_timer.borrow_mut();
@@ -1504,7 +1607,8 @@ fn run_one_generation(
         // silently exiting.
         GenerationOutcome::Disconnected
     };
-    (outcome, cmd_rx)
+    let final_policy = policy_cell.borrow().clone();
+    (outcome, cmd_rx, final_policy)
 }
 
 /// Handle a Registry `global` event. Node globals are joined against their
@@ -1562,6 +1666,8 @@ fn handle_global(
                 // no-op — the durable half (fragment write) still applies
                 // on the next daemon start.
                 gen.capture_node_proxy = registry.bind::<Node, _>(global).ok();
+                gen.set_rnnoise_param(crate::params::RnnoiseParam::DryMix, gen.dry_mix);
+                gen.set_rnnoise_param(crate::params::RnnoiseParam::VadThreshold, gen.vad_threshold);
                 return;
             }
             if node_name == our_source_name {
