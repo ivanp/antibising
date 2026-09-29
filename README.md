@@ -44,6 +44,26 @@ This creates:
 
 The daemon starts automatically as a systemd user service from this point on.
 
+## Arch Linux package
+
+A `PKGBUILD` is provided at the repo root as an alternative to `antibisingd install`.
+It builds both binaries with `cargo build --release --locked` and packages the daemon,
+GUI app, systemd user unit, PipeWire crash-recovery drop-in, `.desktop` entry, and icon:
+
+```sh
+makepkg -si
+```
+
+Then enable the daemon and launch the GUI:
+
+```sh
+systemctl --user enable --now antibisingd.service
+antibising
+```
+
+Remove with `sudo pacman -R antibising`; `~/.config/antibising/config.toml` and the
+PipeWire filter-chain fragment are left in place as user data.
+
 ## Run the desktop app
 
 ```sh
